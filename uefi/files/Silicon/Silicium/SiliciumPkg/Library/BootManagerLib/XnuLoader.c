@@ -28,6 +28,11 @@
 
 #include "XnuLoader.h"
 
+#ifdef XNU_DISPLAY_SNAPSHOT
+#include <Library/DxeServicesTableLib.h>
+#include <Library/XnuDisplaySnapshot.h>
+#endif
+
 #define LOG_SIZE  SIZE_256KB
 
 STATIC CHAR8  *mLog;
@@ -304,10 +309,43 @@ StartPayloadLoader ()
   }
 }
 
+#ifdef XNU_DISPLAY_SNAPSHOT
+//
+// The display's state after all drivers (slot 2; SEC took 0 and 1). The GCC page is the one
+// register block read that the memory map does not map by itself.
+//
+STATIC
+VOID
+SnapshotAfterDrivers ()
+{
+  EFI_GCD_MEMORY_SPACE_DESCRIPTOR Desc;
+  EFI_PHYSICAL_ADDRESS            Page = SNAP_GCC + (SNAP_GCC_DISP_AHB_CBCR & ~0xFFF);
+
+  if (EFI_ERROR (gDS->GetMemorySpaceDescriptor (Page, &Desc))) {
+    return;
+  }
+
+  if (Desc.GcdMemoryType == EfiGcdMemoryTypeNonExistent &&
+      EFI_ERROR (gDS->AddMemorySpace (EfiGcdMemoryTypeMemoryMappedIo, Page, SIZE_4KB, EFI_MEMORY_UC))) {
+    return;
+  }
+
+  if (EFI_ERROR (gDS->SetMemorySpaceAttributes (Page, SIZE_4KB, EFI_MEMORY_UC))) {
+    return;
+  }
+
+  XnuDisplaySnapshot (2);
+}
+#endif
+
 VOID
 XnuLoaderMain ()
 {
   EFI_TIME Time;
+
+#ifdef XNU_DISPLAY_SNAPSHOT
+  SnapshotAfterDrivers ();
+#endif
 
   // Normally does not return
   StartPayloadLoader ();

@@ -35,8 +35,9 @@
 !include LahainaPkg/LahainaPkg.dsc.inc
 
 [BuildOptions]
-  # XnuLoader.c: never write its log to the "logdump" partition (shown on screen instead)
-  *_*_*_CC_FLAGS = -DXNU_NO_LOG_FLASH
+  # XNU_NO_LOG_FLASH: XnuLoader.c never writes its log to the "logdump" partition (shown on screen instead)
+  # XNU_DISPLAY_SNAPSHOT: PlatformSecLib and XnuLoader.c record the display's state at three points (oem dispsnap)
+  *_*_*_CC_FLAGS = -DXNU_NO_LOG_FLASH -DXNU_DISPLAY_SNAPSHOT
 
 [PcdsFixedAtBuild]
   #

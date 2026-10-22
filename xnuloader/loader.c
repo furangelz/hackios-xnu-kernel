@@ -327,6 +327,64 @@ compose_logs(const char *klog, uint64_t klog_len)
 	staged_len = n;
 }
 
+/*
+ * "oem readpart NAME": stage a whole GPT partition for "fastboot get_staged" -- the phone's own
+ * firmware images (xbl_a holds its UEFI drivers). Only read_blocks is called.
+ */
+static int
+read_partition(const char *name)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	static uint64_t buf, buf_pages;
+	efi_handle *handles;
+	uint64_t count;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		return 0;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		efi_status s;
+		uint64_t len;
+		unsigned k;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
+			continue;
+		}
+		for (k = 0; name[k] != 0 && k < 35 && info->name[k] == (char16)name[k]; k++) {
+		}
+		if (name[k] != 0 || info->name[k] != 0 || EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			continue;
+		}
+		len = (bio->media->last_block + 1) * bio->media->block_size;
+		if (len > (64ull << 20)) {
+			print("readpart %s: %d bytes, more than 64 MB: not read\n", name, len);
+			return 0;
+		}
+		if (buf != 0) {
+			BS->free_pages(buf, buf_pages);
+			buf = 0;
+		}
+		buf_pages = (len + 0xfff) >> 12;
+		if (EFI_ERROR(BS->allocate_pages(AllocateAnyPages, EfiLoaderData, buf_pages, &buf))) {
+			buf = 0;
+			return 0;
+		}
+		s = bio->read_blocks(bio, bio->media->media_id, 0, len, (void *)(uintptr_t)buf);
+		print("readpart %s: %d bytes, read %x\n", name, len, s);
+		if (EFI_ERROR(s)) {
+			return 0;
+		}
+		staged_data = (const char *)(uintptr_t)buf;
+		staged_len = len;
+		return 1;
+	}
+	print("readpart %s: no such partition\n", name);
+	return 0;
+}
+
 static int hc_list_is_uefis(void);
 static int hc_log_skips;                /* logs not written this run (said twice at most) */
 static void hc_print_state(const char *when);
@@ -3643,7 +3701,8 @@ fb_command(char *cmd)
 	{
 		if (busy && (starts_with(cmd, "oem ramdisk") || starts_with(cmd, "download:") || starts_with(cmd, "oem run") ||
 		    starts_with(cmd, "oem selftest") || starts_with(cmd, "oem hang") || starts_with(cmd, "oem recording") ||
-		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap"))) {
+		    starts_with(cmd, "oem sound") || starts_with(cmd, "oem clearscreen") || starts_with(cmd, "oem memmap") ||
+		    starts_with(cmd, "oem readpart"))) {
 			fb_reply("FAIL", "a kernel is running (oem stop ends it)");
 		} else if (starts_with(cmd, "oem stop")) {
 			/* the kernel looks at this once a second and comes back as it does when its time is up */
@@ -3760,6 +3819,14 @@ fb_command(char *cmd)
 			staged_data = sound_data;
 			staged_len = sound_len;
 			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem dispsnap")) {
+			/* the UEFI's display snapshots (lemonadep: XnuDisplaySnapshot.h), RAM at the end of the payload region */
+			staged_data = (const char *)(uintptr_t)0xF3FE0000ULL;
+			staged_len = 3 * 0x4000;
+			fb_reply("OKAY", "");
+		} else if (starts_with(cmd, "oem readpart ")) {
+			/* stage one GPT partition, read only; "fastboot get_staged FILE" fetches it */
+			fb_reply(read_partition(cmd + 13) ? "OKAY" : "FAIL", "");
 		} else if (starts_with(cmd, "oem clearscreen")) {
 			if (SCREEN.base != 0) {
 				memset((void *)(uintptr_t)SCREEN.base, 0, (size_t)SCREEN.stride * SCREEN.height);
