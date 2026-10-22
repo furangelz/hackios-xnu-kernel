@@ -255,6 +255,9 @@ clean_dcache(uint64_t start, uint64_t end)
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
 static int log_flash_off = 1;           /* the platform's no_log_flash (off until a platform is chosen) */
+static int log_echo = 1;                /* no log partition: echo a returned kernel log on the console (QEMU only) */
+static const char *last_klog;           /* the last run's kernel log, for "oem log" after it */
+static uint64_t last_klog_len;
 
 static efi_block_io *
 find_log_partition(void)
@@ -334,10 +337,18 @@ write_logs(const char *klog, uint64_t klog_len)
 {
 	efi_block_io *bio = find_log_partition();
 
+	if (klog != NULL) {
+		last_klog = klog;
+		last_klog_len = klog_len;
+	}
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
-		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
-		if (klog != NULL) {
+		/*
+		 * No log partition (QEMU): echo the returned kernel log on the console instead. A phone
+		 * without one (no_log_flash) does not: the echo fills log_buf, after which nothing the
+		 * loader prints is kept (getvar screen answers empty), and the log is fetched over USB.
+		 */
+		if (klog != NULL && log_echo) {
 			print("\n== KERNEL LOG ==\n");
 			for (uint64_t i = 0; i < klog_len; i++) {
 				put_char(klog[i]);
@@ -2765,6 +2776,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		print("no kernel in payload\n");
 		return 0;
 	}
+	last_klog = NULL;               /* this kernel is loaded over the last one's log */
+	last_klog_len = 0;
 	if (!have_checkpoint) {
 		checkpoint = pi.checkpoint;
 	}
@@ -3781,7 +3794,8 @@ fb_command(char *cmd)
 			if (busy) {
 				compose_live_log(running_live, running_slide);
 			} else {
-				compose_logs(NULL, 0);
+				/* after a run: still with its kernel log, which fetching the result needs */
+				compose_logs(last_klog, last_klog_len);
 			}
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
@@ -3972,6 +3986,7 @@ efi_main(efi_handle image, efi_system_table *st)
 	}
 	print("platform %s\n", PLAT->name);
 	log_flash_off = PLAT->no_log_flash;
+	log_echo = PLAT == &platform_qemu_virt;
 
 	install_exception_hook();
 	wdt_arm();
