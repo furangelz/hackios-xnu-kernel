@@ -335,6 +335,7 @@ SnapshotAfterDrivers ()
   }
 
   XnuDisplaySnapshot (2);
+  XnuSnapPadTest (2);
 }
 #endif
 

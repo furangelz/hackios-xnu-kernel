@@ -1503,9 +1503,14 @@ void
 redwood_goodix_init(void)
 {
 	uint32_t enabled = 0;
+	char board[32];
 	thread_t thread;
 
 	if (!PE_parse_boot_argn("touchscreen", &enabled, sizeof(enabled)) || !enabled) {
+		return;
+	}
+	/* another phone (xnuloader's board=): its touch screen is someone else's (redwood_synaptics.c) */
+	if (PE_parse_boot_arg_str("board", board, sizeof(board)) && strcmp(board, "redwood") != 0) {
 		return;
 	}
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));

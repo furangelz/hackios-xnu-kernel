@@ -42,6 +42,7 @@ void redwood_input_init(void);
 void redwood_virtio_input_init(void);   /* boot-arg virtio_input=1: QEMU's virtio pointer and keyboard */
 void redwood_goodix_init(void);         /* boot-arg touchscreen=1: the phone's Goodix or FocalTech touch screen */
 void redwood_buttons_init(void);        /* boot-arg buttons=1: the phone's power and volume keys */
+void redwood_synaptics_init(void);      /* board=lemonadep and touchscreen=1: the OnePlus 9 Pro's Synaptics S3908 */
 void redwood_ufs_init(void);           /* ufs=2 to xnuloader: the phone's storage, read only, through the loader (ufs_shared_pa=) */
 void redwood_ufs_report(const char *when); /* where reading the storage has spent its time so far */
 bool redwood_ufs_dev(dev_t dev);           /* one of the storage's devices */
@@ -50,6 +51,8 @@ int redwood_battery_temperature(void);  /* the battery's temperature in C, -273 
 /* one transfer at a time through the PMIC arbiter for this system (bsd/dev/redwood_buttons.c) */
 void redwood_spmi_lock(void);
 void redwood_spmi_unlock(void);
+/* read 1 to 8 registers of a PMIC peripheral (slave << 8 | peripheral), read only; NULL = done (redwood_buttons.c) */
+const char *redwood_spmi_peek(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count);
 /*
  * How the battery is, as the audio DSP's battery manager says (bsd/dev/redwood_adsp.c, with adsp=1):
  * handed to bsd/dev/redwood_battery.c, which keeps it for the sysctls kern.redwood.battery_* and

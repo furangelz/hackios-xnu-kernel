@@ -96,6 +96,51 @@ XnuSnapNote (
   MmioWrite32 (Slot + 8, Count + 1);
 }
 
+/*
+ * Can a pin's pad be driven? The 9 Pro's touch supply enable (gpio197) driven high reads back
+ * low under the kernel. Tried here at each snapshot point, on the touch's own two enable pins
+ * only (gpio31 is the control, it works): as an input with its pull-up, then as an output at 1,
+ * each read back after 200 us, then the pin is put back exactly as it was. Notes 0x30 + 2i: the
+ * pin's configuration as found; 0x31 + 2i: bit 0 = reads 1 with the pull-up, bit 1 = reads 1
+ * driven high, bits 4/5 = its input/output bits as found.
+ */
+static inline VOID
+XnuSnapSpinUs (
+  IN UINT32 Us)
+{
+  UINT64 Start, Now, Freq;
+
+  __asm__ volatile ("mrs %0, cntfrq_el0" : "=r" (Freq));
+  __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (Start));
+  do {
+    __asm__ volatile ("isb; mrs %0, cntvct_el0" : "=r" (Now));
+  } while ((Now - Start) * 1000000 < (UINT64)Us * Freq);
+}
+
+static inline VOID
+XnuSnapPadTest (
+  IN UINT32 SlotIndex)
+{
+  STATIC CONST UINT32 Pins[] = { 197, 31 };
+
+  for (UINTN i = 0; i < ARRAY_SIZE (Pins); i++) {
+    UINTN  Cfg = SNAP_TLMM + 0x1000 * Pins[i], Io = Cfg + 4;
+    UINT32 Cfg0 = MmioRead32 (Cfg), Io0 = MmioRead32 (Io), Result = (Io0 & 3) << 4;
+
+    MmioWrite32 (Cfg, 3);                   // function 0, input, pull-up, 2 mA
+    XnuSnapSpinUs (200);
+    Result |= MmioRead32 (Io) & 1;
+    MmioWrite32 (Io, 2);                    // the level first: 1
+    MmioWrite32 (Cfg, BIT9);                // then an output, no pull, 2 mA
+    XnuSnapSpinUs (200);
+    Result |= (MmioRead32 (Io) & 1) << 1;
+    MmioWrite32 (Io, Io0 & 2);              // back as it was: level, then configuration
+    MmioWrite32 (Cfg, Cfg0);
+    XnuSnapNote (SlotIndex, (UINT32)(0x30 + 2 * i), Cfg0);
+    XnuSnapNote (SlotIndex, (UINT32)(0x31 + 2 * i), Result);
+  }
+}
+
 // A branch clock is read through only when it reports itself running. "Asked for but off" is
 // not enough: the first version took that for on and hung the phone (2026-10-22, in SEC or
 // after the drivers, unknown which), so the display controller itself is not read at all now.

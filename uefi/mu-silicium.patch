@@ -52,7 +52,7 @@ index 4d208553..9f0056a8 100644
  
  _Entry:
 diff --git a/Silicon/Qualcomm/LahainaPkg/Library/PlatformSecLib/PlatformSec.c b/Silicon/Qualcomm/LahainaPkg/Library/PlatformSecLib/PlatformSec.c
-index 59eba109..2ec86ce8 100644
+index 59eba109..f2f8d168 100644
 --- a/Silicon/Qualcomm/LahainaPkg/Library/PlatformSecLib/PlatformSec.c
 +++ b/Silicon/Qualcomm/LahainaPkg/Library/PlatformSecLib/PlatformSec.c
 @@ -10,6 +10,10 @@
@@ -66,19 +66,20 @@ index 59eba109..2ec86ce8 100644
  VOID
  WakeUpCores ()
  {
-@@ -31,6 +35,11 @@ WakeUpCores ()
+@@ -31,6 +35,12 @@ WakeUpCores ()
  VOID
  PlatformInitialize ()
  {
 +#ifdef XNU_DISPLAY_SNAPSHOT
 +  // The Bootloader's Display State, before anything here touches it
 +  XnuDisplaySnapshot (0);
++  XnuSnapPadTest (0);
 +#endif
 +
    // Wake Up Cores
    WakeUpCores ();
  
-@@ -39,4 +48,8 @@ PlatformInitialize ()
+@@ -39,4 +49,8 @@ PlatformInitialize ()
  
    // Detach IOMMU Domains
    ArmSmmuDetach (MdpStreams, ARRAY_SIZE (MdpStreams));

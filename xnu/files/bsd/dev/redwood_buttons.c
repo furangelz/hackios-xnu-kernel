@@ -7,6 +7,10 @@
  *   power        KPDPWR_N of the power-on block ("PON") of the PMK8350
  *   volume down  RESIN_N of the same block
  *   volume up    GPIO6 of the PM7325, pulled up; the key pulls it low
+ * The OnePlus 9 Pro (lemonadep, SM8350; board=lemonadep from xnuloader) has the same three
+ * inputs at the same addresses -- GPIO6 is the PM8350's there, also slave 1, registers 0x8d00 --
+ * with the volume keys the other way round: RESIN_N is volume up, GPIO6 volume down (its device
+ * tree: pon_hlos@1300 pon_2 linux,code 115; gpio_keys gpios = <&pm8350_gpios 6>, code 114).
  * Both chips sit on the SPMI bus (slaves 0 and 1), and the way to that bus is the SoC's "PMIC
  * arbiter": it owns the bus and gives each of the systems on the chip (this one, the modem, the
  * always-on processor, TrustZone...) a set of registers per PMIC peripheral -- a "channel" -- to
@@ -151,6 +155,7 @@ struct peripheral {
 };
 static struct peripheral pon = { .name = "the PMK8350's power-on block", .id = 0x013 };          /* registers 0x1300 of slave 0 */
 static struct peripheral pin = { .name = "GPIO6 of the PM7325", .id = 0x18d };                   /* registers 0x8d00 of slave 1 */
+static bool lemonadep;          /* board=lemonadep: RESIN_N is volume up, GPIO6 (the PM8350's) volume down */
 
 /* How the reads have gone: said once a minute. */
 static struct {
@@ -232,6 +237,45 @@ find_channel(struct peripheral *p, uint32_t channels)
 	}
 }
 
+/*
+ * For other drivers (bsd/dev/redwood_synaptics.c: is a regulator really on?): read `count` (1 to 8)
+ * registers of a PMIC peripheral -- id = slave << 8 | peripheral, from register `reg` -- through this
+ * system's observer channel. The same kind of read as the buttons', and only reads. NULL when done,
+ * otherwise what went wrong.
+ */
+const char *
+redwood_spmi_peek(uint16_t id, uint8_t reg, uint8_t *bytes, uint32_t count)
+{
+	struct peripheral p = { .name = "a PMIC peripheral", .id = id };
+	uint32_t channels;
+
+	if (count == 0 || count > 8) {
+		return "only 1 to 8 registers at a time";
+	}
+	if (arb_core == 0 || arb_cnfg == 0 || arb_observer == 0) {
+		arb_core = ml_io_map(ARB_CORE_PHYS, ARB_CORE_SIZE);
+		arb_cnfg = ml_io_map(ARB_CNFG_PHYS, ARB_CNFG_SIZE);
+		arb_observer = ml_io_map(ARB_OBSERVER_PHYS, ARB_OBSERVER_SIZE);
+	}
+	if (rd(arb_core + ARB_VERSION) < ARB_VERSION_5 || rd(arb_core + ARB_VERSION) >= ARB_VERSION_7) {
+		return "not an arbiter of version 5";
+	}
+	channels = rd(arb_core + ARB_FEATURES) & 0x7ff;
+	if (channels == 0 || channels > ARB_MAX_CHANNELS) {
+		channels = ARB_MAX_CHANNELS;
+	}
+	for (uint32_t n = 0; n < channels && !p.found; n++) {
+		if (((rd(arb_core + ARB_CHANNEL(n)) >> 8) & 0xfff) == id) {
+			p.found = true;
+			p.channel = (uint16_t)n;
+		}
+	}
+	if (!p.found) {
+		return "no channel of the arbiter is that peripheral";
+	}
+	return spmi_read(&p, reg, bytes, count);
+}
+
 /* ---- the two peripherals ------------------------------------------------------------------------- */
 
 /* every peripheral of these PMICs */
@@ -276,6 +320,8 @@ static struct button {
 } power = { .name = "power", .record = REDWOOD_BUTTON_LOCK },
     volume_up = { .name = "volume up", .record = REDWOOD_BUTTON_VOLUME_UP },
     volume_down = { .name = "volume down", .record = REDWOOD_BUTTON_VOLUME_DOWN };
+/* which key each input is (swapped on lemonadep) */
+static struct button *resin_key = &volume_down, *pin_key = &volume_up;
 
 /* "12.345 s (08:13:05.918 UTC)": since boot as in the log's own stamps, and as the daemons' lines have it */
 static void
@@ -333,20 +379,20 @@ buttons_poll(void)
 	const char *problem;
 	uint8_t status;
 
-	if (power.usable || volume_down.usable) {
+	if (power.usable || resin_key->usable) {
 		problem = spmi_read(&pon, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
 			button_look(&power, status & PON_KPDPWR);
-			button_look(&volume_down, status & PON_RESIN);
+			button_look(resin_key, status & PON_RESIN);
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pon.name, problem);
 		}
 	}
-	if (volume_up.usable) {
+	if (pin_key->usable) {
 		problem = spmi_read(&pin, REG_RT_STATUS, &status, 1);
 		if (problem == NULL) {
-			button_look(&volume_up, !(status & GPIO_LEVEL));
+			button_look(pin_key, !(status & GPIO_LEVEL));
 		} else if (said < 8) {
 			said++;
 			printf("buttons: reading %s: %s\n", pin.name, problem);
@@ -399,12 +445,12 @@ pon_inputs(void)
 	    "enabled %#x, latched %#x, pending %#x\n", r[0], (r[0] & PON_KPDPWR) ? "HELD" : "released",
 	    (r[0] & PON_RESIN) ? "HELD" : "released", r[REG_INT_SET_TYPE - REG_RT_STATUS], r[REG_INT_POLARITY_HIGH - REG_RT_STATUS],
 	    r[REG_INT_POLARITY_LOW - REG_RT_STATUS], r[REG_INT_ENABLED - REG_RT_STATUS], more[0], more[1]);
-	power.usable = volume_down.usable = true;
+	power.usable = resin_key->usable = true;
 	power.last = r[0] & PON_KPDPWR;
-	volume_down.last = r[0] & PON_RESIN;
+	resin_key->last = r[0] & PON_RESIN;
 }
 
-/* Step 4 for the pin: it is volume up only if it is an input with a pull-up, and switched on. */
+/* Step 4 for the pin: it is a volume key only if it is an input with a pull-up, and switched on. */
 static void
 pin_input(void)
 {
@@ -423,18 +469,18 @@ pin_input(void)
 	}
 	mode = c[0] & 3;
 	pull = c[GPIO_REG_PULL - GPIO_REG_MODE] & 7;
-	printf("buttons: volume up's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
-	    "%02x %02x; level %s\n", mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
+	printf("buttons: %s's pin: mode %u (%s), supply %u, pull %u (%s), %s; registers 0x40.. = %02x %02x %02x %02x %02x %02x "
+	    "%02x %02x; level %s\n", pin_key->name, mode, mode == 0 ? "input" : mode == 1 ? "output" : mode == 2 ? "input and output" : "analog",
 	    c[GPIO_REG_SUPPLY - GPIO_REG_MODE] & 7, pull, pull < 4 ? "up" : pull == 4 ? "down" : "none",
 	    (c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80) ? "enabled" : "DISABLED", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7],
 	    (status & GPIO_LEVEL) ? "high (released)" : "LOW (held)");
 	if (mode != 0 || pull >= 4 || !(c[GPIO_REG_ENABLE - GPIO_REG_MODE] & 0x80)) {
-		printf("buttons: volume up's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
-		    "which this driver does not do: volume up is left alone\n");
+		printf("buttons: %s's pin is not an enabled input with a pull-up. Making it one is a write to the PMIC, "
+		    "which this driver does not do: %s is left alone\n", pin_key->name, pin_key->name);
 		return;
 	}
-	volume_up.usable = true;
-	volume_up.last = !(status & GPIO_LEVEL);
+	pin_key->usable = true;
+	pin_key->last = !(status & GPIO_LEVEL);
 }
 
 static void
@@ -493,7 +539,7 @@ buttons_thread(void *parameter, __unused wait_result_t result)
 	if (pin_known) {
 		pin_input();
 	}
-	if (!power.usable && !volume_up.usable) {
+	if (!power.usable && !pin_key->usable) {
 		printf("buttons: nothing that can be read: no buttons\n");
 		goto out;
 	}
@@ -552,6 +598,13 @@ redwood_buttons_init(void)
 	PE_parse_boot_argn("buttons_steps", &steps, sizeof(steps));
 	if (steps == 0) {
 		return;
+	}
+	char board[32];
+	if (PE_parse_boot_arg_str("board", board, sizeof(board)) && strcmp(board, "lemonadep") == 0) {
+		lemonadep = true;
+		pin.name = "GPIO6 of the PM8350";
+		resin_key = &volume_up;
+		pin_key = &volume_down;
 	}
 	if (kernel_thread_start(buttons_thread, (void *)(uintptr_t)steps, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
