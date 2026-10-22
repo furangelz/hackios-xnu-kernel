@@ -34,6 +34,10 @@
 
 !include LahainaPkg/LahainaPkg.dsc.inc
 
+[BuildOptions]
+  # XnuLoader.c: never write its log to the "logdump" partition (shown on screen instead)
+  *_*_*_CC_FLAGS = -DXNU_NO_LOG_FLASH
+
 [PcdsFixedAtBuild]
   #
   # DDR Memory

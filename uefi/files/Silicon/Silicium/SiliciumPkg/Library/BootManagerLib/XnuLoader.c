@@ -7,6 +7,9 @@
   Android over adb, and cold-resets. Nothing is shown to the user on purpose:
   the phone is driven unattended.
 
+  A platform built with XNU_NO_LOG_FLASH (lemonadep) never writes a partition:
+  the log is shown on the screen for a minute before the reset instead.
+
   SPDX-License-Identifier: BSD-2-Clause-Patent
 **/
 
@@ -50,6 +53,7 @@ Log (
 
 #define READ_SYSREG(Name) ({ UINT64 _Value; __asm__ volatile ("mrs %0, " #Name : "=r" (_Value)); _Value; })
 
+#ifndef XNU_NO_LOG_FLASH
 STATIC
 EFI_BLOCK_IO_PROTOCOL *
 FindPartition (
@@ -85,6 +89,7 @@ FindPartition (
 
   return NULL;
 }
+#endif
 
 STATIC
 VOID
@@ -209,6 +214,9 @@ STATIC
 VOID
 FlushLog ()
 {
+#ifdef XNU_NO_LOG_FLASH
+  return;
+#else
   EFI_STATUS             Status;
   EFI_BLOCK_IO_PROTOCOL *BlockIo;
   UINTN                  BlockSize;
@@ -226,7 +234,34 @@ FlushLog ()
   if (!EFI_ERROR (Status)) {
     BlockIo->FlushBlocks (BlockIo);
   }
+#endif
 }
+
+#ifdef XNU_NO_LOG_FLASH
+STATIC
+VOID
+ShowLog ()
+{
+  CHAR16 Line[128];
+  UINTN  Len = 0;
+
+  gST->ConOut->ClearScreen (gST->ConOut);
+
+  for (UINTN i = 0; i < mLogLen; i++) {
+    if (mLog[i] != '\n') {
+      Line[Len++] = (CHAR16)mLog[i];
+    }
+
+    if (mLog[i] == '\n' || Len == ARRAY_SIZE (Line) - 3) {
+      Line[Len++] = L'\r';
+      Line[Len++] = L'\n';
+      Line[Len]   = 0;
+      gST->ConOut->OutputString (gST->ConOut, Line);
+      Len = 0;
+    }
+  }
+}
+#endif
 
 //
 // The payload is a list of named blobs. If it carries "loader.efi", that is
@@ -297,6 +332,10 @@ XnuLoaderMain ()
     LogPersistence ();
     Log ("== END ==\n");
     FlushLog ();
+#ifdef XNU_NO_LOG_FLASH
+    ShowLog ();
+    gBS->Stall (60 * 1000 * 1000);
+#endif
   }
 
   // The phone is unattended: always come back to Android.
