@@ -1,8 +1,29 @@
 diff --git a/BootShim/BootShim.S b/BootShim/BootShim.S
-index 4d208553..3c3b17bb 100644
+index 4d208553..9f0056a8 100644
 --- a/BootShim/BootShim.S
 +++ b/BootShim/BootShim.S
-@@ -28,6 +28,27 @@ _CopyLoop:
+@@ -17,6 +17,20 @@ _StackSize:
+ #endif
+ 
+ _Start:
++#ifdef FB_TEST_BASE
++  /* display test (lemonadep): a red band over the first 150 rows, straight from the bootloader.
++     No "ldr =": a literal pool would land after _Payload, where the UEFI image is appended. */
++  movz  x7, #(FB_TEST_BASE >> 16), lsl #16
++  movz  x8, #((FB_TEST_STRIDE * 150 / 8) & 0xFFFF)
++  movk  x8, #((FB_TEST_STRIDE * 150 / 8) >> 16), lsl #16
++  movz  x9, #0xFFFF, lsl #16
++  orr   x9, x9, x9, lsl #32
++
++_FbTestLoop:
++  str   x9, [x7], #8
++  subs  x8, x8, #1
++  b.ne  _FbTestLoop
++#endif
+   mov   x4, x1
+   ldr   x5, =FD_BASE
+   cmp   x4, x5
+@@ -28,6 +42,27 @@ _CopyLoop:
    stp   x2, x3, [x5], #16
    subs  x6, x6, #16
    b.ne  _CopyLoop
@@ -31,7 +52,7 @@ index 4d208553..3c3b17bb 100644
  
  _Entry:
 diff --git a/Silicon/Qualcomm/LahainaPkg/Library/PlatformSecLib/PlatformSec.c b/Silicon/Qualcomm/LahainaPkg/Library/PlatformSecLib/PlatformSec.c
-index 59eba109..2ec86ce8 100644
+index 59eba109..8114910b 100644
 --- a/Silicon/Qualcomm/LahainaPkg/Library/PlatformSecLib/PlatformSec.c
 +++ b/Silicon/Qualcomm/LahainaPkg/Library/PlatformSecLib/PlatformSec.c
 @@ -10,6 +10,10 @@
@@ -45,25 +66,27 @@ index 59eba109..2ec86ce8 100644
  VOID
  WakeUpCores ()
  {
-@@ -31,6 +35,11 @@ WakeUpCores ()
+@@ -31,6 +35,12 @@ WakeUpCores ()
  VOID
  PlatformInitialize ()
  {
 +#ifdef XNU_DISPLAY_SNAPSHOT
 +  // The Bootloader's Display State, before anything here touches it
 +  XnuDisplaySnapshot (0);
++  XnuFbTestBand (1, 0xFF00FF00);
 +#endif
 +
    // Wake Up Cores
    WakeUpCores ();
  
-@@ -39,4 +48,8 @@ PlatformInitialize ()
+@@ -39,4 +49,9 @@ PlatformInitialize ()
  
    // Detach IOMMU Domains
    ArmSmmuDetach (MdpStreams, ARRAY_SIZE (MdpStreams));
 +
 +#ifdef XNU_DISPLAY_SNAPSHOT
 +  XnuDisplaySnapshot (1);
++  XnuFbTestBand (2, 0xFF0000FF);
 +#endif
  }
 diff --git a/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c b/Silicon/Silicium/SiliciumPkg/Library/BootManagerLib/BootManager.c

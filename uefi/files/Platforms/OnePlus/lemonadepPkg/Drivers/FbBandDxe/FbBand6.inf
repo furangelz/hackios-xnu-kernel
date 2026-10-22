@@ -1,0 +1,26 @@
+[Defines]
+  INF_VERSION    = 0x00010005
+  BASE_NAME      = FbBand6
+  FILE_GUID      = 8F2D7993-91DC-4428-9535-8B931C720FF2
+  MODULE_TYPE    = DXE_DRIVER
+  VERSION_STRING = 1.0
+  ENTRY_POINT    = FbBandEntry
+
+[Sources]
+  FbBandDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  SiliciumPkg/SiliciumPkg.dec
+
+[LibraryClasses]
+  UefiDriverEntryPoint
+  UefiBootServicesTableLib
+  DxeServicesTableLib
+  IoLib
+
+[BuildOptions]
+  *_*_*_CC_FLAGS = -DFB_BAND=6 -DFB_COLOR=0xffffffff -DFB_DUMP=0
+
+[Depex]
+  TRUE

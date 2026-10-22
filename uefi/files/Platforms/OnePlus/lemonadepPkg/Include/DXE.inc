@@ -98,3 +98,14 @@
   INF Binaries/lemonade/QcomPkg/Drivers/PILDxe/PILDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/PILProxyDxe/PILProxyDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/SPSSDxe/SPSSDxe.inf
+
+  # display test (lemonadep): bands painted between driver groups, see APRIORI.inc
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand3.inf  # display test
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand4.inf  # display test
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand5.inf  # display test
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand6.inf  # display test
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand7.inf  # display test
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand8.inf  # display test
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand9.inf  # display test
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand10.inf  # display test
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand11.inf  # display test

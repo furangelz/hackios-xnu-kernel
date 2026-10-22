@@ -3822,7 +3822,7 @@ fb_command(char *cmd)
 		} else if (starts_with(cmd, "oem dispsnap")) {
 			/* the UEFI's display snapshots (lemonadep: XnuDisplaySnapshot.h), RAM at the end of the payload region */
 			staged_data = (const char *)(uintptr_t)0xF3FE0000ULL;
-			staged_len = 3 * 0x4000;
+			staged_len = 5 * 0x2000;      /* 5 slots of 8 KB */
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "oem readpart ")) {
 			/* stage one GPT partition, read only; "fastboot get_staged FILE" fetches it */

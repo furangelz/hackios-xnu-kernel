@@ -11,6 +11,7 @@ APRIORI DXE {
   INF ArmPkg/Drivers/ArmGicDxe/ArmGicDxe.inf
   INF EmbeddedPkg/MetronomeDxe/MetronomeDxe.inf
   INF ArmPkg/Drivers/TimerDxe/TimerDxe.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand3.inf  # display test
 
   INF Binaries/lemonade/QcomPkg/Drivers/SmemDxe/SmemDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/DALSYSDxe/DALSYSDxe.inf
@@ -18,20 +19,26 @@ APRIORI DXE {
   INF Binaries/lemonade/QcomPkg/Drivers/ChipInfoDxe/ChipInfoDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/PlatformInfoDxe/PlatformInfoDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/HALIOMMUDxe/HALIOMMUDxe.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand4.inf  # display test
   INF Binaries/lemonade/QcomPkg/Drivers/ULogDxe/ULogDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/CmdDbDxe/CmdDbDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/PwrUtilsDxe/PwrUtilsDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/NpaDxe/NpaDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/RpmhDxe/RpmhDxe.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand5.inf  # display test
   INF Binaries/lemonade/QcomPkg/Drivers/VcsDxe/VcsDxe.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand6.inf  # display test
   INF Binaries/lemonade/QcomPkg/Drivers/ClockDxe/ClockDxe.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand7.inf  # display test
   INF Binaries/lemonade/QcomPkg/Drivers/ICBDxe/ICBDxe.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand8.inf  # display test
   INF Binaries/lemonade/QcomPkg/Drivers/ShmBridgeDxe/ShmBridgeDxeLA.inf
   INF Binaries/lemonade/QcomPkg/Drivers/TzDxe/ScmDxeLA.inf
   INF Binaries/lemonade/QcomPkg/Drivers/TLMMDxe/TLMMDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/I2CDxe/I2CDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/SPMIDxe/SPMIDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/PmicDxe/PmicDxeLa.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand9.inf  # display test
 
   INF Binaries/lemonade/MdeModulePkg/Universal/Disk/DiskIoDxe/DiskIoDxe.inf
   INF Binaries/lemonade/MdeModulePkg/Universal/Disk/PartitionDxe/PartitionDxe.inf
@@ -51,6 +58,7 @@ APRIORI DXE {
   INF MdeModulePkg/Universal/ResetSystemRuntimeDxe/ResetSystemRuntimeDxe.inf
 
   INF Binaries/lemonade/QcomPkg/Drivers/FeatureEnablerDxe/FeatureEnablerDxe.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand10.inf  # display test
 
 !if $(USE_CUSTOM_DISPLAY_DRIVER) == 1
   INF Binaries/lemonade/QcomPkg/Drivers/DisplayDxe/DisplayDxe.inf
@@ -63,6 +71,7 @@ APRIORI DXE {
   INF Binaries/lemonade/QcomPkg/Drivers/SPSSDxe/SPSSDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/IPCCDxe/IPCCDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/GLinkDxe/GLinkDxe.inf
+  INF lemonadepPkg/Drivers/FbBandDxe/FbBand11.inf  # display test
 
   INF MdeModulePkg/Universal/WatchdogTimerDxe/WatchdogTimer.inf
   INF MdeModulePkg/Universal/SecurityStubDxe/SecurityStubDxe.inf

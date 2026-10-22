@@ -344,6 +344,7 @@ XnuLoaderMain ()
   EFI_TIME Time;
 
 #ifdef XNU_DISPLAY_SNAPSHOT
+  XnuFbTestBand (12, 0xFFFFFF00);
   SnapshotAfterDrivers ();
 #endif
 

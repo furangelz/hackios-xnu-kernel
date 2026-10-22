@@ -16,8 +16,10 @@ Another device (common/devices/<name>.conf, read by common/build.sh) sets these 
   UEFI_TARGET   Mu-Silicium device name (default redwood)    UEFI_FD, DTB   files to use instead
   FD_BASE, FD_SIZE, PAYLOAD_BASE                              addresses from its UEFI port's memory map
   BOOT_HEADER_VERSION                                         what the phone's ABL takes (default 1; SM8350: 3)
+  DTB=none                                                    append no device tree: ABL uses the phone's own
+  BOOT_ARGS                                                   more mkbootimg arguments (os_version, cmdline, ...)
 """
-import argparse, gzip, os, subprocess, sys
+import argparse, gzip, os, shlex, subprocess, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MU = os.path.join(HERE, 'Mu-Silicium')
@@ -43,7 +45,8 @@ if os.path.isfile(fd_path) and os.path.isdir(os.path.join(MU, 'BootShim')):
         try: os.unlink(os.path.join(shim_dir, f))
         except FileNotFoundError: pass
     subprocess.check_call(['make', 'REQUIRES_KERNEL_HEADER=1', f'FD_BASE={FD_BASE:#x}', f'FD_SIZE={FD_SIZE:#x}',
-                           f'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={PAYLOAD_BASE:#x}'],
+                           f'CFLAGS=--target=aarch64-linux-gnu -DPAYLOAD_BASE={PAYLOAD_BASE:#x} '
+                           + os.environ.get('BOOTSHIM_DEFS', '')],
                           cwd=shim_dir, stdout=subprocess.DEVNULL)
     parts = {'shim': os.path.join(shim_dir, 'BootShim.bin'), 'fd': fd_path,
              'dtb': os.path.join(MU, f'Resources/DTBs/{TARGET}.dtb'), 'ramdisk': os.path.join(MU, 'Resources/ramdisk'),
@@ -67,12 +70,15 @@ if args.payload:
     print(f'payload: {len(data)} bytes, bytesum={sum(data) & 0xffffffff:08x}')
 
 if os.environ.get('DTB'): parts['dtb'] = os.environ['DTB']
-dtb = open(parts['dtb'], 'rb').read()
+# DTB=none (lemonadep): append none and ABL takes the phone's own from vendor_boot, as for the
+# ios-sweet shim (the OnePlus 9 tree is not the 9 Pro's; it was not what froze the panel, though)
+dtb = b'' if parts['dtb'] == 'none' else open(parts['dtb'], 'rb').read()
 kernel = args.output + '.kernel~'
 open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
 try:
     subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
-                           '--header_version', str(HEADER_VERSION), '-o', args.output])
+                           '--header_version', str(HEADER_VERSION), '-o', args.output] +
+                          shlex.split(os.environ.get('BOOT_ARGS', '')))
 finally:
     os.unlink(kernel)
 print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')
