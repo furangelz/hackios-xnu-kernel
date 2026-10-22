@@ -540,6 +540,8 @@ static const struct platform platform_qemu_virt = {
 	 * is that of real hardware: an eighth of a second by a 24 MHz clock, a twentieth here.
 	 */
 	.timeout_scale = 20,
+	/* QEMU has no "logdump"; a phone whose framebuffer matched no entry must not write one either */
+	.no_log_flash = 1,
 };
 
 static const struct platform platform_redwood = {
