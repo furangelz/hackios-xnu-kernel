@@ -76,6 +76,26 @@ XnuSnapRead (
   MmioWrite32 (Slot + 8, Count + 1);
 }
 
+// Append a value under a tag (an "address" below 0x100000, where no register is read) to slot
+// SlotIndex, after XnuDisplaySnapshot has filled it: results of calls made around it.
+static inline VOID
+XnuSnapNote (
+  IN UINT32 SlotIndex,
+  IN UINT32 Tag,
+  IN UINT32 Value)
+{
+  UINTN  Slot  = XNU_SNAP_BASE + SlotIndex * XNU_SNAP_SLOT_SIZE;
+  UINT32 Count = MmioRead32 (Slot + 8);
+
+  if (SlotIndex >= XNU_SNAP_SLOTS || MmioRead32 (Slot) != XNU_SNAP_MAGIC || 16 + 8 * (Count + 1) > XNU_SNAP_SLOT_SIZE) {
+    return;
+  }
+
+  MmioWrite32 (Slot + 16 + 8 * Count, Tag);
+  MmioWrite32 (Slot + 20 + 8 * Count, Value);
+  MmioWrite32 (Slot + 8, Count + 1);
+}
+
 // A branch clock is read through only when it reports itself running. "Asked for but off" is
 // not enough: the first version took that for on and hung the phone (2026-10-22, in SEC or
 // after the drivers, unknown which), so the display controller itself is not read at all now.

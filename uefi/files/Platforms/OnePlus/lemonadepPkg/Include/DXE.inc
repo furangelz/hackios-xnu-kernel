@@ -43,7 +43,7 @@
   INF Binaries/lemonade/QcomPkg/Drivers/NpaDxe/NpaDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/ULogDxe/ULogDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/VcsDxe/VcsDxe.inf
-  INF Binaries/lemonade/QcomPkg/Drivers/ClockDxe/ClockDxe.inf
+  INF lemonadepPkg/Binaries/ClockDxe/ClockDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/ICBDxe/ICBDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/SmemDxe/SmemDxe.inf
   INF MdeModulePkg/Universal/BdsDxe/BdsDxe.inf
@@ -98,14 +98,3 @@
   INF Binaries/lemonade/QcomPkg/Drivers/PILDxe/PILDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/PILProxyDxe/PILProxyDxe.inf
   INF Binaries/lemonade/QcomPkg/Drivers/SPSSDxe/SPSSDxe.inf
-
-  # display test (lemonadep): bands painted between driver groups, see APRIORI.inc
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand3.inf  # display test
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand4.inf  # display test
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand5.inf  # display test
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand6.inf  # display test
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand7.inf  # display test
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand8.inf  # display test
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand9.inf  # display test
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand10.inf  # display test
-  INF lemonadepPkg/Drivers/FbBandDxe/FbBand11.inf  # display test

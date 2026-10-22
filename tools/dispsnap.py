@@ -37,6 +37,8 @@ for cb in range(75):
         NAMES[SMMU_CB + cb * 0x1000 + off] = 'smmu cb%d %s' % (cb, name)
 for cb in range(128):
     NAMES.setdefault(SMMU + 0x1000 + 4 * cb, 'smmu cbar%d' % cb)
+NAMES.update({0x10: 'note LocateProtocol(Clock)', 0x11: 'note GetClockPowerDomainID', 0x12: 'note mdss gdsc domain id',
+              0x13: 'note EnableClockPowerDomain'})
 PLL_REGS = {0x00: 'mode', 0x04: 'l', 0x08: 'cal_l', 0x0C: 'user_ctl', 0x10: 'user_ctl_u', 0x14: 'user_ctl_u1',
             0x18: 'config_ctl', 0x1C: 'config_ctl_u', 0x20: 'config_ctl_u1', 0x30: 'status', 0x38: 'opmode', 0x40: 'alpha'}
 for pll in (0, 1):

@@ -89,15 +89,3 @@
   #
   lemonade/AcpiTables.inf
 
-  #
-  # Display test: bands painted between driver groups (APRIORI.inc)
-  #
-  lemonadepPkg/Drivers/FbBandDxe/FbBand3.inf
-  lemonadepPkg/Drivers/FbBandDxe/FbBand4.inf
-  lemonadepPkg/Drivers/FbBandDxe/FbBand5.inf
-  lemonadepPkg/Drivers/FbBandDxe/FbBand6.inf
-  lemonadepPkg/Drivers/FbBandDxe/FbBand7.inf
-  lemonadepPkg/Drivers/FbBandDxe/FbBand8.inf
-  lemonadepPkg/Drivers/FbBandDxe/FbBand9.inf
-  lemonadepPkg/Drivers/FbBandDxe/FbBand10.inf
-  lemonadepPkg/Drivers/FbBandDxe/FbBand11.inf

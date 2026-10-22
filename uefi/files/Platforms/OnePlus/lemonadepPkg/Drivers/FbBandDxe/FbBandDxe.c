@@ -2,7 +2,9 @@
   Display test (lemonadep): paints band FB_BAND of the bootloader's framebuffer in FB_COLOR when
   it is started, a second after. Instances sit between groups of drivers in APRIORI.inc; the
   last band that reaches the panel names the group after which it stopped taking new frames.
-  Seen: the panel stops the moment ClockDxe starts (band 7 complete, band 8 never shown).
+  Seen: the panel stops the moment ClockDxe starts (band 7 complete, band 8 never shown); the
+  cause was Clock_InitVoltage (Binaries/ClockDxe/patch.py). Not in the build now: to use it again,
+  list FbBand<N>.inf in APRIORI.inc between drivers, in DXE.inc and in lemonadep.dsc.
 
   FB_DUMP = 0 (the instance before ClockDxe) / 1 (after): also record display snapshot slot
   3 / 4 (XnuDisplaySnapshot.h: clocks, PLLs, clock sources, SMMU, pins), as close to ClockDxe as
@@ -17,6 +19,10 @@
 #include <Library/DxeServicesTableLib.h>
 #include <Library/UefiBootServicesTableLib.h>
 #include <Library/XnuDisplaySnapshot.h>
+
+#ifdef FB_MMCX_TEST
+#include <Protocol/EFIClock.h>
+#endif
 
 #ifdef FB_DUMP
 //
@@ -54,6 +60,39 @@ Record ()
 }
 #endif
 
+#ifdef FB_MMCX_TEST
+//
+// Seen: ClockDxe changes no display clock, PLL, clock source or the power switch (slots 3/4 are
+// the same), yet the panel stops as it starts. What it does own is the MMCX rail (/vcs/vdd_mm,
+// ClockRailConfig) the display block runs on: a fresh vote that knows no display user would drop
+// it. Telling ClockDxe that the display's power domain is in use makes it vote that rail again.
+// Notes in slot 4: 0x10 LocateProtocol, 0x11 GetClockPowerDomainID, 0x12 the id, 0x13 Enable.
+//
+STATIC
+VOID
+DisplayDomainInUse ()
+{
+  EFI_CLOCK_PROTOCOL *Clock;
+  EFI_STATUS          Status;
+  UINTN               Id = 0;
+
+  Status = gBS->LocateProtocol (&gEfiClockProtocolGuid, NULL, (VOID **)&Clock);
+  XnuSnapNote (4, 0x10, (UINT32)Status);
+  if (EFI_ERROR (Status)) {
+    return;
+  }
+
+  Status = Clock->GetClockPowerDomainID (Clock, "disp_cc_mdss_core_gdsc", &Id);
+  XnuSnapNote (4, 0x11, (UINT32)Status);
+  XnuSnapNote (4, 0x12, (UINT32)Id);
+  if (EFI_ERROR (Status)) {
+    return;
+  }
+
+  XnuSnapNote (4, 0x13, (UINT32)Clock->EnableClockPowerDomain (Clock, Id));
+}
+#endif
+
 EFI_STATUS
 EFIAPI
 FbBandEntry (
@@ -62,6 +101,10 @@ FbBandEntry (
 {
 #if defined (FB_DUMP) && FB_DUMP == 1
   Record ();
+#endif
+
+#ifdef FB_MMCX_TEST
+  DisplayDomainInUse ();
 #endif
 
   gBS->Stall (1000000);

@@ -12,12 +12,16 @@
 [Packages]
   MdePkg/MdePkg.dec
   SiliciumPkg/SiliciumPkg.dec
+  QcomPkg/QcomPkg.dec
 
 [LibraryClasses]
   UefiDriverEntryPoint
   UefiBootServicesTableLib
   DxeServicesTableLib
   IoLib
+
+[Protocols]
+  gEfiClockProtocolGuid
 
 [BuildOptions]
   *_*_*_CC_FLAGS = -DFB_BAND=7 -DFB_COLOR=0xffff8000 -DFB_DUMP=1
