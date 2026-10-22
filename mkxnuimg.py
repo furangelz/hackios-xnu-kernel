@@ -15,6 +15,7 @@ usage: mkxnuimg.py [-p payload.bin] [-o out.img]
 Another device (common/devices/<name>.conf, read by common/build.sh) sets these in the environment:
   UEFI_TARGET   Mu-Silicium device name (default redwood)    UEFI_FD, DTB   files to use instead
   FD_BASE, FD_SIZE, PAYLOAD_BASE                              addresses from its UEFI port's memory map
+  BOOT_HEADER_VERSION                                         what the phone's ABL takes (default 1; SM8350: 3)
 """
 import argparse, gzip, os, subprocess, sys
 
@@ -27,6 +28,7 @@ def env_int(name, default):
 TARGET = os.environ.get('UEFI_TARGET') or 'redwood'
 FD_BASE, FD_SIZE = env_int('FD_BASE', 0x9FD00000), env_int('FD_SIZE', 0x200000)
 PAYLOAD_BASE, PAYLOAD_MAX = env_int('PAYLOAD_BASE', 0xF0000000), 0x04000000
+HEADER_VERSION = env_int('BOOT_HEADER_VERSION', 1)
 
 ap = argparse.ArgumentParser()
 ap.add_argument('-p', '--payload')
@@ -70,7 +72,7 @@ kernel = args.output + '.kernel~'
 open(kernel, 'wb').write(gzip.compress(blob, 6) + dtb)
 try:
     subprocess.check_call([sys.executable, parts['mkbootimg'], '--kernel', kernel, '--ramdisk', parts['ramdisk'],
-                           '--header_version', '1', '-o', args.output])
+                           '--header_version', str(HEADER_VERSION), '-o', args.output])
 finally:
     os.unlink(kernel)
 print(f'{args.output}: {os.path.getsize(args.output)} bytes (shim {len(shim)}, uncompressed {len(blob)})')

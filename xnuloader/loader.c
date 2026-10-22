@@ -254,6 +254,8 @@ clean_dcache(uint64_t start, uint64_t end)
 /* ------------------------------------------------------------------------ */
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
+static int log_flash_off = 1;           /* the platform's no_log_flash (off until a platform is chosen) */
+
 static efi_block_io *
 find_log_partition(void)
 {
@@ -263,7 +265,7 @@ find_log_partition(void)
 	efi_handle *handles;
 	uint64_t count;
 
-	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+	if (log_flash_off || EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
 		return NULL;
 	}
 	for (uint64_t i = 0; i < count; i++) {
@@ -525,6 +527,7 @@ struct platform {
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
+	int no_log_flash;                /* never write the log to the "logdump" partition: fetch it over USB */
 };
 
 static const struct platform platform_qemu_virt = {
@@ -558,8 +561,25 @@ static const struct platform platform_redwood = {
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
+/*
+ * OnePlus 9 Pro (lemonadep, SM8350), from the ios-sweet bring-up on that phone: GIC and core numbering
+ * as redwood (checked by its shim: GICD/GICR here, PSCI SMC starts cores 0x100..0x700), cores 0-3 are
+ * Cortex-A55s, 4-6 A78s, 7 an X1. ABL leaves the panel scanning out 1080x2412 (stride 4320) at
+ * 0xE4D00000, the "Display Reserved" region of Mu-Silicium's lemonade memory map. Nothing is written
+ * to the phone's flash: no log partition, no watchdog or charger (those are redwood-only below).
+ */
+static const struct platform platform_lemonadep = {
+	.name = "lemonadep", .io_base = 0x00400000, .io_size = 0x3FC00000,
+	.gic_dist = 0x17A00000, .gic_redist = 0x17A60000, .uart = 0, .log_other_cpu = 0,
+	.cores = 8, .core_shift = 8,
+	.small_cores = 0x0f,
+	.fb_base = 0xE4D00000,
+	.no_log_flash = 1,
+};
+
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_lemonadep,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -3949,6 +3969,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	log_flash_off = PLAT->no_log_flash;
 
 	install_exception_hook();
 	wdt_arm();
