@@ -327,19 +327,42 @@ compose_logs(const char *klog, uint64_t klog_len)
 	staged_len = n;
 }
 
+static uint64_t parse_number(const char *c, unsigned base);
+
 /*
  * "oem readpart NAME": stage a whole GPT partition for "fastboot get_staged" -- the phone's own
- * firmware images (xbl_a holds its UEFI drivers). Only read_blocks is called.
+ * firmware images (xbl_a holds its UEFI drivers). "oem readpart NAME OFFSET LENGTH" (hex, in
+ * bytes, whole blocks): a window of one, for those over 64 MB -- the 9 Pro's /vendor is inside its
+ * "super". Only read_blocks is called.
  */
 static int
-read_partition(const char *name)
+read_partition(const char *args)
 {
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
 	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
 	static uint64_t buf, buf_pages;
 	efi_handle *handles;
-	uint64_t count;
+	uint64_t count, offset = 0, want = 0;
+	char name[36];
+	unsigned n;
 
+	for (n = 0; args[n] != 0 && args[n] != ' ' && n < sizeof(name) - 1; n++) {
+		name[n] = args[n];
+	}
+	name[n] = 0;
+	if (args[n] == ' ') {
+		const char *c = args + n + 1;
+
+		offset = parse_number(c, 16);
+		while (*c != 0 && *c != ' ') {
+			c++;
+		}
+		want = *c == ' ' ? parse_number(c + 1, 16) : 0;
+		if (want == 0) {
+			print("readpart %s: a window needs an offset and a length\n", name);
+			return 0;
+		}
+	}
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
 		return 0;
 	}
@@ -359,6 +382,15 @@ read_partition(const char *name)
 			continue;
 		}
 		len = (bio->media->last_block + 1) * bio->media->block_size;
+		if (want != 0) {
+			if (offset % bio->media->block_size != 0 || want % bio->media->block_size != 0 || offset >= len ||
+			    want > len - offset) {
+				print("readpart %s: window %x + %x is not whole blocks of %x inside %x bytes\n", name, offset, want,
+				    bio->media->block_size, len);
+				return 0;
+			}
+			len = want;
+		}
 		if (len > (64ull << 20)) {
 			print("readpart %s: %d bytes, more than 64 MB: not read\n", name, len);
 			return 0;
@@ -372,8 +404,8 @@ read_partition(const char *name)
 			buf = 0;
 			return 0;
 		}
-		s = bio->read_blocks(bio, bio->media->media_id, 0, len, (void *)(uintptr_t)buf);
-		print("readpart %s: %d bytes, read %x\n", name, len, s);
+		s = bio->read_blocks(bio, bio->media->media_id, offset / bio->media->block_size, len, (void *)(uintptr_t)buf);
+		print("readpart %s: %d bytes at %x, read %x\n", name, len, offset, s);
 		if (EFI_ERROR(s)) {
 			return 0;
 		}

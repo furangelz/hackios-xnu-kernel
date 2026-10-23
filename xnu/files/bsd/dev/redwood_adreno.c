@@ -70,7 +70,8 @@
  *                      with, through the service RedwoodGPU (see "the GPU kept on" below); it is
  *                      given back when the run ends (adreno_dirty=1: left as a panic leaves it)
  *   adreno_speed=N     step 17 asks the GMU for the 3D core's Nth speed: 1 315 MHz, 2 450 MHz,
- *                      3 550 MHz (the default: the most this phone's GPU is rated for)
+ *                      3 550 MHz (the default: the most this phone's GPU is rated for); on the 9 Pro
+ *                      315, 443 and 540 MHz (it is rated for up to 840)
  *   adreno_blind=1     step 20 starts the command processor with its microcode nowhere, and
  *   adreno_stream1=N   step 18 leaves the core's second stream out (0) or gives it an empty
  *                      context of its own (2): what the SMMU then records shows what the core
@@ -90,6 +91,19 @@
  * registers/adreno/a6xx{,_gmu}.xml, drivers/iommu/arm/arm-smmu/arm-smmu.h, drivers/soc/qcom/
  * cmd-db.c, drivers/firmware/qcom/qcom_scm{,-smc}.c, drivers/soc/qcom/mdt_loader.c. The phone's
  * vendor kernel agrees on every offset used here, and is the only source for the frequency counter.
+ *
+ * The OnePlus 9 Pro (lemonadep, SM8350 "lahaina"; boot-arg board=lemonadep, which its loader
+ * gives) has an Adreno 660 in a GPU block that is this one register for register. Its vendor
+ * kernel (LineageOS android_kernel_oneplus_sm8350) has both SoCs' files side by side, and
+ * gpucc-{yupik,lahaina}.c, gcc-*, debugcc-*, the GPU's power switches and the nodes of the GMU,
+ * its RPMh channel and sequencer, the SMMU and the temperature sensors agree on every offset used
+ * here. What differs is in `lemonadep_values` below, each with its source: the fuse, one selection
+ * of the frequency counter, the 3D core (chip ID 0x06060001, dt lahaina-v2-gpu.dtsi; 1.5 MB of
+ * GMEM, bank bit 16, its primitive FIFO and command queue settings: adreno-gpulist.h and
+ * adreno_a6xx.c a6xx_start), its speeds, the GMU's chip ID and one word of its RPMh channel's
+ * program (adreno_a6xx_gmu.c), and where the zap shader goes (dt pil_gpu_region@8b51a000).
+ * The vendor's driver runs one start sequence for both GPUs (adreno_is_a660() is true for the
+ * A642L too).
  */
 #include <kern/clock.h>
 #include <libkern/libkern.h>
@@ -111,6 +125,56 @@ static uint32_t speed_bin;              /* which of the GPUs of this kind the fu
 static uint32_t newest_step;            /* the highest one asked for: the one that has not been seen to work */
 static char last_write[96] = "nothing written";
 static bool quiet;                      /* repeating accesses that have been announced and seen to work: say nothing */
+
+/*
+ * What differs between the two phones' GPUs; everything else is the same (see the head of this
+ * file). The redwood's values are the ones this file had before the 9 Pro.
+ */
+struct gpu_values {
+	const char *name;
+	uint32_t gcc_debug_gpucc;       /* the frequency counter's selection of the GPU clock controller (debugcc-*.c) */
+	uint32_t gmu_chip;              /* the chip ID the way the GMU's firmware wants it (HFI_SFR_ADDR) */
+	uint64_t chip_id;               /* msm's CHIP_ID; the redwood's has the speed bin above it */
+	uint32_t gmem;                  /* bytes */
+	uint32_t bank_bit;              /* the highest bank bit of the memory, for UBWC */
+	uint32_t pc_dbg_eco_cntl;       /* the primitive FIFO's threshold, and bit 9 (vccCacheSkipDis) */
+	uint32_t rb_nc_mode, tpl1_nc_mode, sp_nc_mode, uche_mode;      /* UBWC: the bank bit, and the rest */
+	uint32_t uche_cmdq_config;      /* 0: not written */
+	uint32_t rscc_tcs_cmd2;         /* the data of the GMU's RPMh channel's third hidden command */
+	uint64_t zap_memory;
+	struct {
+		uint32_t khz, level;
+	} speeds[4];
+	uint32_t target_height, ccu_cntl;       /* step 22: the panel's height; RB_CCU_CNTL for drawing to memory */
+};
+
+static const struct gpu_values redwood_values = {
+	.name = "Adreno 642L", .gcc_debug_gpucc = 0x146, .gmu_chip = 0x06035000, .chip_id = 0x06030500,
+	.gmem = 512 * 1024, .bank_bit = 14, .pc_dbg_eco_cntl = 0x00200200,
+	.rb_nc_mode = 1u << 11 | 1u << 4 | 1u << 1, .tpl1_nc_mode = 1u << 1, .sp_nc_mode = 2u << 4 | 1u << 1,
+	.uche_mode = 1u << 21, .rscc_tcs_cmd2 = 0x80000021, .zap_memory = 0x8b71a000,
+	.speeds = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } },
+	.target_height = 2400, .ccu_cntl = 0x10000004,
+};
+
+/*
+ * dt (lahaina-v2-gpu.dtsi, every speed bin): 315 MHz at "level" 64 (LOW_SVS), 443 at 128 (SVS),
+ * 540 at 192 (SVS_L1), up to 840 at 416; the three lowest here, as for the redwood. Bank bit 16
+ * (dt qcom,highest-bank-bit), UBWC 4.0 (dt qcom,ubwc-mode): the four mode registers as a6xx_start
+ * makes them of that. The vendor's driver writes 0x80000000 as the third hidden command
+ * (a6xx_load_rsc_ucode; the redwood's 0x80000021 is mainline Linux's). Three CCUs, so the colour
+ * cache for drawing into memory starts at 3 x 64K (Mesa's ccu_offset_bypass).
+ */
+static const struct gpu_values lemonadep_values = {
+	.name = "Adreno 660", .gcc_debug_gpucc = 0x153, .gmu_chip = 0x06060100, .chip_id = 0x06060001,
+	.gmem = 1536 * 1024, .bank_bit = 16, .pc_dbg_eco_cntl = 0x00300200,
+	.rb_nc_mode = 1u << 11 | 1u << 4 | 3u << 1, .tpl1_nc_mode = 3u << 1, .sp_nc_mode = 2u << 4 | 3u << 1,
+	.uche_mode = 3u << 21, .uche_cmdq_config = 0x66906, .rscc_tcs_cmd2 = 0x80000000, .zap_memory = 0x8b51a000,
+	.speeds = { { 0, 0 }, { 315000, 64 }, { 443000, 128 }, { 540000, 192 } },
+	.target_height = 2412, .ccu_cntl = 0x18000004,
+};
+
+static const struct gpu_values *board = &redwood_values;
 
 /*
  * The kernel's log reaches the loader when a run is over, and a run that ends in a reset
@@ -290,7 +354,20 @@ static struct block gcc = { "gcc", 0x00100000, 0x80000 };
 #define GCC_GPU_SNOC_DVM_GFX_CBCR 0x71018
 #define GCC_DDRSS_GPU_AXI_CBCR  0x71154
 #define CBCR_ENABLE             (1u << 0)       /* a clock's control register: on */
+#define CBCR_HW_GATED           (1u << 1)       /* ... the hardware stops it while nobody uses it */
 #define CBCR_OFF                (1u << 31)      /* ... and whether it is in fact off */
+
+/*
+ * Whether the clock of the GPU clock controller's registers runs. On the 9 Pro the hardware
+ * gates it by itself (gcc-lahaina.c: hwcg_bit 1): on, it reads "off" while nobody talks to the
+ * controller and comes on for an access. Linux does not look at the status of a clock in that
+ * mode (clk-branch.c: clk_branch_wait, clk_branch_in_hwcg_mode), and neither does this.
+ */
+static bool
+cfg_ahb_runs(uint32_t cbcr)
+{
+	return !(cbcr & CBCR_OFF) || (cbcr & (CBCR_ENABLE | CBCR_HW_GATED)) == (CBCR_ENABLE | CBCR_HW_GATED);
+}
 
 /* dt: reserved-memory cmd_db@80860000: the boot loader's list of what RPMh can switch (cmd-db.c) */
 #define CMD_DB_PHYS             0x80860000UL
@@ -414,6 +491,7 @@ static struct block qfprom = { "qfprom", 0x00780000, 0x7000 };
 #define QFPROM_CORRECTED        0x4000
 #define QFPROM_GPU_SPEED_BIN    0x1e9
 #define QFPROM_GPU_GAMING_BIN   0x1f5
+#define QFPROM_LAHAINA_GPU_SPEED_BIN 0x17b      /* the 9 Pro's (dt lahaina.dtsi: qfprom@784000, gpu_speed_bin@17b, 3 bits from bit 5) */
 
 static uint32_t
 get8(struct block *b, const char *name, uint32_t offset)
@@ -435,6 +513,14 @@ step_fuses(void)
 {
 	uint32_t bin, gaming;
 
+	if (board == &lemonadep_values) {
+		announce("read the GPU's speed bin in the error-corrected copy of the fuses (0x784000), where the 9 Pro's "
+		    "device tree has it");
+		speed_bin = get8(&qfprom, "speed bin", QFPROM_CORRECTED + QFPROM_LAHAINA_GPU_SPEED_BIN) >> 5 & 7;
+		/* dt lahaina-v2-gpu.dtsi: bins 0 (up to 840 MHz), 1 and 3 (up to 900); all of them have 315 to 540 */
+		printf("adreno: %u: speed bin %u\n", step, speed_bin);
+		return true;
+	}
 	announce("read the GPU's fuses in the error-corrected copy (0x784000), which Linux reads");
 	bin = get8(&qfprom, "speed bin, low", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN);
 	bin |= get8(&qfprom, "speed bin, high", QFPROM_CORRECTED + QFPROM_GPU_SPEED_BIN + 1) << 8;
@@ -487,7 +573,7 @@ static bool
 step_gpucc(void)
 {
 	announce("make sure the clock of the GPU clock controller's registers runs (gcc_gpu_cfg_ahb)");
-	if ((set(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR, CBCR_ENABLE) & CBCR_OFF) &&
+	if (!cfg_ahb_runs(set(&gcc, "gpu_cfg_ahb", GCC_GPU_CFG_AHB_CBCR, CBCR_ENABLE)) &&
 	    !wait_for(&gcc, GCC_GPU_CFG_AHB_CBCR, CBCR_OFF, 0, 10)) {
 		printf("adreno: %u: it stays off (%#x): the GPU's clock controller would not answer\n", step,
 		    rd(gcc.base + GCC_GPU_CFG_AHB_CBCR));
@@ -528,7 +614,7 @@ gpucc_answers(void)
 {
 	need(&gcc);
 	need(&gpucc);
-	if (rd(gcc.base + GCC_GPU_CFG_AHB_CBCR) & CBCR_OFF) {
+	if (!cfg_ahb_runs(rd(gcc.base + GCC_GPU_CFG_AHB_CBCR))) {
 		printf("adreno: %u: the GPU clock controller's registers have no clock (gcc gpu_cfg_ahb %#x): step 3\n", step,
 		    rd(gcc.base + GCC_GPU_CFG_AHB_CBCR));
 		return false;
@@ -696,7 +782,7 @@ step_clocks(void)
  * clk-debug.c (mainline Linux has no counterpart).
  */
 #define GCC_DEBUG_MUX           0x62000         /* [9:0] which clock goes to the counter */
-#define GCC_DEBUG_MUX_GPUCC     0x146           /* ... the debug output of the GPU's clock controller */
+                                        /* (its selection of the GPU clock controller's output: gcc_debug_gpucc) */
 #define GCC_DEBUG_DIV           0x62004         /* [3:0] divider - 1; both controllers divide by 2 */
 #define GCC_DEBUG_CBCR          0x62008
 #define GCC_XO_DIV4_CBCR        0x6200c         /* the counter's time base: the crystal / 4, 4.8 MHz */
@@ -756,7 +842,7 @@ measure(uint32_t select)
 	put(&gpucc, "debug mux", GPUCC_DEBUG_MUX, (gpu_mux & ~0xffu) | select);
 	put(&gpucc, "debug divider", GPUCC_DEBUG_DIV, (gpu_div & ~0xfu) | 1);
 	put(&gpucc, "debug output", GPUCC_DEBUG_CBCR, gpu_cbcr | CBCR_ENABLE);
-	put(&gcc, "debug mux", GCC_DEBUG_MUX, (mux & ~0x3ffu) | GCC_DEBUG_MUX_GPUCC);
+	put(&gcc, "debug mux", GCC_DEBUG_MUX, (mux & ~0x3ffu) | board->gcc_debug_gpucc);
 	put(&gcc, "debug divider", GCC_DEBUG_DIV, (div & ~0xfu) | 1);
 	put(&gcc, "debug input", GCC_DEBUG_CBCR, cbcr | CBCR_ENABLE);
 	put(&gcc, "crystal/4", GCC_XO_DIV4_CBCR, base | CBCR_ENABLE);
@@ -1875,7 +1961,7 @@ step_gmu_firmware(void)
 #define GMU_RSCC_CONTROL_REQ    GMU_WORD(0x9307)
 #define GMU_AO_AHB_FENCE_CTRL   GMU_WORD(0x9310)
 #define GMU_AHB_FENCE_RANGE_0   GMU_WORD(0x9311)
-#define GMU_CHIP                0x06035000      /* dt qcom,chipid 0x06030500 the way the firmware wants it */
+                                        /* (GMU_HFI_SFR_ADDR at start: gmu_chip, the chip ID the way the firmware wants it) */
 #define GMU_STARTED_MASK        0x1ff           /* of fw_init_result, for firmware newer than core 0x20010004 */
 #define GMU_STARTED             0x100
 #define GMU_FAILED              0xe00
@@ -1957,7 +2043,7 @@ step_gmu_start(void)
 	put(&gmu, "cm3_cfg", GMU_CM3_CFG, 0x4052);
 	put(&gbif, "halt", GBIF_HALT, 0);
 	put(&gmu, "pwr_col_cp_resp", GMU_PWR_COL_CP_RESP, 0);
-	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, GMU_CHIP);
+	put(&gmu, "hfi_sfr_addr", GMU_HFI_SFR_ADDR, board->gmu_chip);
 	put(&gmu, "pwr_col_cp_msg", GMU_PWR_COL_CP_MSG, GMU_LOG_ADDRESS | (GMU_LOG_SIZE / 4096 - 1));
 	put(&gmu, "sys_bus_config", GMU_SYS_BUS_CONFIG, 1);
 	put(&gmu, "icache_config", GMU_ICACHE_CONFIG, 1);
@@ -2022,7 +2108,7 @@ step_gmu_queues(void)
 
 	announce("give the GMU's RPMh channel its sleep and wake program (rscc, 0x3de0000), unless it has it");
 	if (get(&rscc, "seq_mem_0_drv0", RSCC_SEQ_MEM_0_DRV0) == program[0] &&
-	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == 0x80000021) {
+	    get(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4) == board->rscc_tcs_cmd2) {
 		goto programmed;
 	}
 	put(&rscc, "rsc_status0_drv0", RSCC_RSC_STATUS0_DRV0, 1u << 24);
@@ -2031,7 +2117,7 @@ step_gmu_queues(void)
 	put(&rscc, "hidden_tcs_cmd0_addr", RSCC_HIDDEN_TCS_CMD0_ADDR, 0);
 	put(&rscc, "hidden_tcs_cmd1_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 2, 0);
 	put(&rscc, "hidden_tcs_cmd1_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 2, 0);
-	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, 0x80000021);    /* a650 and later */
+	put(&rscc, "hidden_tcs_cmd2_data", RSCC_HIDDEN_TCS_CMD0_DATA + 4 * 4, board->rscc_tcs_cmd2);
 	put(&rscc, "hidden_tcs_cmd2_addr", RSCC_HIDDEN_TCS_CMD0_ADDR + 4 * 4, 0);
 	put(&rscc, "override_start_addr", RSCC_OVERRIDE_START_ADDR, 0);
 	put(&rscc, "pdc_seq_start_addr", RSCC_PDC_SEQ_START_ADDR, 0x4520);
@@ -2274,7 +2360,8 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 /*
  * What the vendor's driver sends at this point (a6xx_hfi_start; Linux the same with fewer
  * levels): the table of speeds of the 3D core with the supply level each needs -- the phone's
- * three lowest (dt: qcom,gpu-pwrlevels: 315, 450, 550 MHz at "levels" 64, 128, 192) -- and of the
+ * three lowest (dt: qcom,gpu-pwrlevels: 315, 450, 550 MHz at "levels" 64, 128, 192; the 9 Pro's:
+ * 315, 443, 540 at the same levels, `speeds` of the values above) -- and of the
  * GMU itself; the table of bus bandwidth votes, of which Linux gets by with the one for "off"
  * (a6xx_hfi.c: adreno_7c3_build_bw_table); "start"; and the speed wanted now. Then the request
  * to keep the 3D core powered while we use it (a6xx_gmu_oob_set), and its registers can be read.
@@ -2282,9 +2369,6 @@ static uint32_t core_khz;               /* the 3D core's speed, as asked of the 
 static bool
 step_core_power(void)
 {
-	static const struct {
-		uint32_t khz, level;
-	} speeds[] = { { 0, 0 }, { 315000, 64 }, { 450000, 128 }, { 550000, 192 } };
 	static struct hfi_perf_table perf;
 	static struct hfi_bw_table bw;
 	uint32_t core_start[2] = { 0, 0 }, start[1] = { 0 }, vote[4] = { 0, 1, 3, HFI_NO_INDEX }, granted = 0, speed = 0;
@@ -2299,12 +2383,12 @@ step_core_power(void)
 		printf("adreno: %u: RPMh's list lacks one of the rails\n", step);
 		return false;
 	}
-	perf.gpu_levels = sizeof(speeds) / sizeof(speeds[0]);
+	perf.gpu_levels = sizeof(board->speeds) / sizeof(board->speeds[0]);
 	for (unsigned i = 0; i < perf.gpu_levels; i++) {
-		perf.gpu[i].khz = speeds[i].khz;
+		perf.gpu[i].khz = board->speeds[i].khz;
 		perf.gpu[i].acd = 0xffffffff;           /* no adaptive clocking */
-		if (!rail_vote(speeds[i].level, gfx, gfx_levels, mx, mx_levels, &perf.gpu[i].vote)) {
-			printf("adreno: %u: RPMh has no level %u for the 3D core's rail\n", step, speeds[i].level);
+		if (!rail_vote(board->speeds[i].level, gfx, gfx_levels, mx, mx_levels, &perf.gpu[i].vote)) {
+			printf("adreno: %u: RPMh has no level %u for the 3D core's rail\n", step, board->speeds[i].level);
 			return false;
 		}
 	}
@@ -2338,7 +2422,7 @@ step_core_power(void)
 	if (PE_parse_boot_argn("adreno_speed", &speed, sizeof(speed)) && speed >= 1 && speed < perf.gpu_levels) {
 		vote[2] = speed;
 	}
-	core_khz = speeds[vote[2]].khz;
+	core_khz = board->speeds[vote[2]].khz;
 	printf("adreno: %u: the speed wanted: %u MHz\n", step, core_khz / 1000);
 	announce("send the GMU its tables (speeds and supply levels, bus votes), \"start\", and the speed wanted; "
 	    "from here on it casts votes in RPMh by itself");
@@ -2620,7 +2704,7 @@ step_core_space(void)
  * (Step 21 is what tells whether the 3D core gets out of secure mode with it.) There was a
  * boot-arg adreno_zap=0 for the second and later runs of a started phone; nothing reads it now.
  */
-#define ZAP_MEMORY              0x8b71a000ull
+#define ZAP_MEMORY              (board->zap_memory)    /* the 9 Pro's: pil_gpu_region@8b51a000 */
 #define ZAP_MEMORY_SIZE         0x2000u
 #define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
 #define SCM_THREE_VALUES        3
@@ -2728,23 +2812,28 @@ step_core_start(void)
 	put(&gpu, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x8040362c);
 	put(&gpu, "cp_lpac_prog_fifo_size", CP_LPAC_PROG_FIFO_SIZE, 0x20);
 	put(&gpu, "cp_mem_pool_size", CP_MEM_POOL_SIZE, 128);
-	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, 0x00200200);
+	put(&gpu, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, board->pc_dbg_eco_cntl);
 	put(&gpu, "cp_ahb_cntl", CP_AHB_CNTL, 1);
 	/*
 	 * How textures in the GPU's own tiled and compressed layouts are laid out in memory (Linux's
 	 * a6xx_calc_ubwc_config, a6xx_set_ubwc_config for this GPU: highest bank bit 14, and the
-	 * rest as below); Mesa is told the same (redwood_gpu_parameter()).
+	 * rest as below; the 9 Pro's: bank bit 16, the vendor's a6xx_start); Mesa is told the same
+	 * (redwood_gpu_parameter()).
 	 */
-	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), 1u << 11 | 1u << 4 | 1u << 1);
-	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), 1u << 1);
-	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), 2u << 4 | 1u << 1);
-	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), 1u << 21);
+	put(&gpu, "rb_nc_mode_cntl", GPU_WORD(0x8e08), board->rb_nc_mode);
+	put(&gpu, "tpl1_nc_mode_cntl", GPU_WORD(0xb604), board->tpl1_nc_mode);
+	put(&gpu, "sp_nc_mode_cntl", GPU_WORD(0xae02), board->sp_nc_mode);
+	put(&gpu, "uche_mode_cntl", GPU_WORD(0x0e01), board->uche_mode);
 	put(&gpu, "rbbm_nc_mode_cntl", GPU_WORD(0x0534), 1);
 	put(&gpu, "rbbm_perfctr_cntl", RBBM_PERFCTR_CNTL, 1);
 	put(&gpu, "rbbm_interface_hang_int_cntl", RBBM_INTERFACE_HANG_INT_CNTL, 1u << 30 | 0x1fffff);
 	put(&gpu, "uche_client_pf", UCHE_CLIENT_PF, 1u << 7 | 1);
 	put(&gpu, "cp_chicken_dbg", CP_CHICKEN_DBG, 1);
 	put(&gpu, "rbbm_gbif_client_qos_cntl", RBBM_GBIF_CLIENT_QOS_CNTL, 0);
+	if (board->uche_cmdq_config != 0) {
+		/* "dualQ + disable afull": Linux's for the A660 alone (a6xx_hw_init), the vendor's for the family */
+		put(&gpu, "uche_cmdq_config", GPU_WORD(0x0e3c), board->uche_cmdq_config);
+	}
 	put(&gpu, "cp_apriv_cntl", CP_APRIV_CNTL, 1u << 6 | 1u << 5 | 1u << 3 | 1u << 2 | 1u << 1);
 	put(&gpu, "rb_dbg_eco_cntl", RB_DBG_ECO_CNTL, 0x04100000);     /* Mesa's value for this GPU */
 	/*
@@ -2856,7 +2945,7 @@ step_core_commands(void)
 #define EVENT_FLUSH_COLOR       0x1d
 #define EVENT_CACHE_FLUSH       0x04
 #define TARGET_WIDTH            1080
-#define TARGET_HEIGHT           2400
+#define TARGET_HEIGHT           (board->target_height)  /* the panel's: 2400, the 9 Pro's 2412 */
 #define TARGET_ROW              4352            /* 1088 pixels: the next multiple of 64 bytes */
 
 extern void MiniIOMobileFramebufferShow(const uint8_t *pixels, uint32_t width, uint32_t height, uint32_t row_bytes);
@@ -2887,6 +2976,7 @@ static bool
 step_frame(void)
 {
 	const volatile uint8_t *pixel;
+	uint32_t last = (TARGET_HEIGHT - 1) * TARGET_ROW;       /* where the last row begins */
 
 	if (!cx_ready() || !core_runs) {
 		return false;
@@ -2901,7 +2991,7 @@ step_frame(void)
 	}
 	ring_command(CP_SET_MARKER, 1);
 	ring(12);                               /* "2D blits follow" */
-	ring_register(RB_CCU_CNTL, 0x10000004); /* Mesa's for this GPU when it draws straight into memory */
+	ring_register(RB_CCU_CNTL, board->ccu_cntl);    /* Mesa's for this GPU when it draws straight into memory */
 	ring_fill(0, 800, 255, 128, 0);         /* orange */
 	ring_fill(800, 1600, 255, 255, 255);
 	ring_fill(1600, TARGET_HEIGHT, 0, 128, 255);
@@ -2933,10 +3023,9 @@ step_frame(void)
 	printf("adreno: %u: the picture's first pixel is %02x %02x %02x %02x (blue green red alpha; told: 00 80 ff ff), one in "
 	    "the middle %02x %02x %02x %02x, one in the last row %02x %02x %02x %02x\n", step, pixel[0], pixel[1], pixel[2],
 	    pixel[3], pixel[1200 * TARGET_ROW + 2160], pixel[1200 * TARGET_ROW + 2161], pixel[1200 * TARGET_ROW + 2162],
-	    pixel[1200 * TARGET_ROW + 2163], pixel[2399 * TARGET_ROW + 4316], pixel[2399 * TARGET_ROW + 4317],
-	    pixel[2399 * TARGET_ROW + 4318], pixel[2399 * TARGET_ROW + 4319]);
-	if ((pixel[0] | pixel[1] | pixel[2]) == 0 || pixel[1200 * TARGET_ROW + 2160] == 0 || (pixel[2399 * TARGET_ROW + 4316] |
-	    pixel[2399 * TARGET_ROW + 4317] | pixel[2399 * TARGET_ROW + 4318]) == 0) {
+	    pixel[1200 * TARGET_ROW + 2163], pixel[last + 4316], pixel[last + 4317], pixel[last + 4318], pixel[last + 4319]);
+	if ((pixel[0] | pixel[1] | pixel[2]) == 0 || pixel[1200 * TARGET_ROW + 2160] == 0 || (pixel[last + 4316] |
+	    pixel[last + 4317] | pixel[last + 4318]) == 0) {
 		printf("adreno: %u: the picture is not what the 3D core was told to draw\n", step);
 		return false;
 	}
@@ -3170,7 +3259,6 @@ redwood_adreno_quiesce(void)
  * (redwood_gpu_recover() below, which says what is done and which source says so). Without it
  * such a submission is only reported, and the GPU stays stopped.
  */
-#define GPU_CHIP_ID             0x06030500ull   /* dt: qcom,chipid */
 #define GPU_ADDRESSES_START     0x20000000ull   /* above everything the steps use; below 4 GB, as Linux keeps them */
 #define GPU_ADDRESSES_SIZE      0xe0000000ull
 #define GPU_FENCE_AT            0x40            /* in the scratch page */
@@ -3346,10 +3434,14 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 0;
 		return true;
 	case 0x02:                              /* GMEM_SIZE */
-		*value = 512 * 1024;
+		*value = board->gmem;
 		return true;
-	case 0x03:                              /* CHIP_ID, with the speed bin above it */
-		*value = GPU_CHIP_ID | (uint64_t)speed_bin << 32;
+	case 0x03:                              /* CHIP_ID (dt: qcom,chipid), with the redwood's speed bin above it */
+		/*
+		 * Mesa finds the redwood's GPU by its speed bin (freedreno_devices.py: "FD643" and the
+		 * Adreno 7c+ entries, 0x....06030500); the A660 by its chip ID alone, as Linux gives it.
+		 */
+		*value = board->chip_id | (board == &redwood_values ? (uint64_t)speed_bin << 32 : 0);
 		return true;
 	case 0x04:                              /* MAX_FREQ */
 		*value = core_khz * 1000ull;
@@ -3361,7 +3453,7 @@ redwood_gpu_parameter(uint32_t which, uint64_t *value)
 		*value = 1;
 		return true;
 	case 0x10:                              /* HIGHEST_BANK_BIT */
-		*value = 14;
+		*value = board->bank_bit;
 		return true;
 	case 0x12:                              /* UBWC_SWIZZLE */
 		*value = 6;
@@ -4027,9 +4119,18 @@ redwood_adreno_init(void)
 	};
 	uint32_t only = 0, done = 0, failed = 0, keep = 0;
 	bool by_itself = false;
+	char machine[32];
 
+	if (PE_parse_boot_arg_str("board", machine, sizeof(machine)) && strcmp(machine, "lemonadep") == 0) {
+		board = &lemonadep_values;
+	}
 	if (PE_parse_boot_argn("display_probe", &only, sizeof(only)) && only) {
-		display_probe();
+		if (board == &redwood_values) {
+			display_probe();
+		} else {
+			/* (its display clock controller's registers are elsewhere: dt disp_cc_mdss_core_gdsc@af03000) */
+			printf("adreno: display_probe is the redwood's; not on this phone\n");
+		}
 	}
 	if (!PE_parse_boot_argn("adreno", &last_step, sizeof(last_step))) {
 		if (!(PE_parse_boot_argn("gpu", &only, sizeof(only)) && only) || !start_by_itself()) {
@@ -4059,8 +4160,8 @@ redwood_adreno_init(void)
 	for (newest_step = last_step; newest_step > 0 && (skip_steps & 1u << newest_step); newest_step--) {
 	}
 
-	printf("adreno: steps up to %u, without those in mask %#x; step %u is the new one and waits %u ms %s\n", last_step,
-	    skip_steps, newest_step, pause_ms, fine ? "before every access" : "after each announcement");
+	printf("adreno: %s; steps up to %u, without those in mask %#x; step %u is the new one and waits %u ms %s\n", board->name,
+	    last_step, skip_steps, newest_step, pause_ms, fine ? "before every access" : "after each announcement");
 	for (step = 1; step <= last_step; step++) {
 		if (skip_steps & 1u << step) {
 			continue;
