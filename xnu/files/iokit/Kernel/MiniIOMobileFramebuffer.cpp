@@ -4,7 +4,9 @@
  *
  * The display is the framebuffer the boot loader left us (the one the kernel's text console
  * draws on). There is no hardware behind it that we drive: a "swap" copies the pixels of the
- * surfaces of its layers into that memory, and "vsync" is a timer.
+ * surfaces of its layers into that memory, and "vsync" is a timer. Except on the OnePlus 9 Pro,
+ * whose display engine is ours to point at another picture (setupFlips() below): there a frame is
+ * drawn where the engine is not reading, and the panel never shows half of one.
  *
  * The protocol (selectors and the layout of the swap request) was worked out from the
  * user-space side of iOS 16.5. Everything not implemented is logged once.
@@ -41,6 +43,11 @@ extern struct vc_info vinfo;            /* the boot framebuffer, as the text con
 #include "MiniIOSurface.h"
 
 extern "C" void redwood_tl(const char * format, ...) __printflike(1, 2);
+/* the OnePlus 9 Pro's display engine (bsd/dev/redwood_dpu.c) */
+extern "C" bool redwood_dpu_ready(void);
+extern "C" void redwood_dpu_flip(uint64_t phys);
+extern "C" bool redwood_dpu_flipped(void);
+extern "C" void redwood_dpu_say(const char * line);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -162,6 +169,21 @@ static TUNABLE(uint32_t, gOnTheBeat, "fb_beat", 1);
  * to 10 (the phone, 15 October; fb_threads=1 is how it was).
  */
 static TUNABLE(uint32_t, gThreads, "fb_threads", 3);
+/*
+ * Flips (the OnePlus 9 Pro). The engine sends the framebuffer to the panel 120 times a second by
+ * itself, a transfer of 2.8 ms, and a frame copied into that memory while a transfer reads it
+ * reached the panel half old, half new: tearing. So there are two pictures, the boot loader's
+ * framebuffer and a second one behind it in the memory the device tree reserves for the panel
+ * (lemonade_common.dtsi: cont_splash, 0xe4d00000, 0x2300000 long: room for three pictures of
+ * 1080 x 2412; the engine's address registers have 32 bits, and the system's own memory below
+ * 4 GB is not to be had in one piece). A frame is drawn into the one the engine is not reading,
+ * the engine is pointed at it, which it takes at the start of a transfer, and the next frame
+ * waits until it has: no transfer ever reads a picture that is being drawn. With a frame that
+ * does not cover the panel with its bottom layer (never seen: CoreAnimation's always does) the
+ * picture on the panel is drawn on as before, so that nothing two frames old comes back.
+ */
+#define kSecondPicturePhys      0xe5700000ULL
+#define kFlipWaitMs             100                     /* the engine takes a flip within a refresh: 8.3 ms */
 #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
 static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
 static inline unsigned
@@ -231,6 +253,14 @@ class IOMobileFramebuffer : public IOService
 public:
 	IOLock *        fLock;
 	uint8_t *       fBase;                  /* the boot framebuffer: the panel */
+	uint8_t *       fDraw;                  /* where this frame is drawn: fBase, or with flips the picture not on the panel */
+	bool            fFlips;                 /* frames go to the panel by flips (setupFlips()) */
+	uint8_t *       fPicture[2];            /* ... the two pictures, fBase first, and where they are */
+	uint64_t        fPicturePhys[2];
+	unsigned        fShowing;               /* ... the one the engine reads */
+	IOMemoryMap *   fSecondMap;
+	uint32_t        fStatFlips;             /* flips, and how long they waited for the engine together (us) */
+	uint64_t        fStatFlipWait;
 	uint32_t        fPanelWidth, fPanelHeight, fRowBytes;
 	uint32_t        fWidth, fHeight;        /* the display as user space sees it */
 	MiniIOSurface * fDefaultSurface;
@@ -303,7 +333,7 @@ public:
 	void presenter(void);
 	static void presenterMain(void * self, wait_result_t result);
 	void reportFrameTimes(void);
-	void drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
+	bool drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst);
 	void drawRows(const struct RowJob * job, int32_t y0, int32_t y1, uint32_t * blendRow);
 	static void helperMain(void * self, wait_result_t result);
 	/* the scaling shared out (fb_threads): fThreads drawers, the presenter and fThreads - 1 helpers */
@@ -314,6 +344,8 @@ public:
 	unsigned        fHelpersBusy, fHelpersStarted;
 	uint32_t *      fHelperBlend[7];
 	void record(MiniIOSurface * s);
+	void setupFlips(void);
+	bool flipTo(unsigned picture, uint64_t * waited);
 };
 
 OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
@@ -420,7 +452,7 @@ IOMobileFramebuffer::start(IOService * provider)
 		thread_set_thread_name(thread, "frames to the panel: a helper");
 		thread_deallocate(thread);
 	}
-	fBase = (uint8_t *) vinfo.v_baseaddr;
+	fBase = fDraw = (uint8_t *) vinfo.v_baseaddr;
 	fPanelWidth = vinfo.v_width;
 	fPanelHeight = vinfo.v_height;
 	fRowBytes = vinfo.v_rowbytes;
@@ -475,6 +507,7 @@ IOMobileFramebuffer::start(IOService * provider)
 		}
 	}
 
+	setupFlips();
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
 	setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
@@ -482,6 +515,74 @@ IOMobileFramebuffer::start(IOService * provider)
 	setName("disp0");
 	registerService();
 	return true;
+}
+
+/* The engine pointed at a picture; true once it has taken it, with how long that was (us). */
+bool
+IOMobileFramebuffer::flipTo(unsigned picture, uint64_t * waited)
+{
+	uint64_t began = mach_absolute_time(), limit, nanos;
+
+	nanoseconds_to_absolutetime(kFlipWaitMs * NSEC_PER_MSEC, &limit);
+	redwood_dpu_flip(fPicturePhys[picture]);
+	while (!redwood_dpu_flipped()) {
+		if (mach_absolute_time() - began > limit) {
+			return false;
+		}
+		delay(50);
+	}
+	fShowing = picture;
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &nanos);
+	*waited = nanos / NSEC_PER_USEC;
+	return true;
+}
+
+/*
+ * Flips, where there is an engine to point (see kSecondPicturePhys): the second picture mapped,
+ * what is on the panel copied into it, and the engine pointed there and back -- if it does not
+ * take that, frames go into the framebuffer as before.
+ */
+void
+IOMobileFramebuffer::setupFlips(void)
+{
+	size_t bytes = (size_t) fRowBytes * fPanelHeight;
+	IOMemoryDescriptor * md;
+	uint64_t there = 0, back = 0;
+
+	if (!redwood_dpu_ready()) {
+		return;
+	}
+	if (vinfo.v_physaddr != 0xe4d00000ULL) {
+		IOLog("MiniIOMobileFramebuffer: the framebuffer is at %#llx, not where the display engine reads: no flips\n",
+		    vinfo.v_physaddr);
+		return;
+	}
+	md = IOMemoryDescriptor::withPhysicalAddress((IOPhysicalAddress) kSecondPicturePhys, bytes, kIODirectionInOut);
+	fSecondMap = md != NULL ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
+	OSSafeReleaseNULL(md);
+	if (fSecondMap == NULL) {
+		IOLog("MiniIOMobileFramebuffer: no mapping for a second picture at %#llx: no flips\n", kSecondPicturePhys);
+		return;
+	}
+	fPicture[0] = fBase;
+	fPicturePhys[0] = vinfo.v_physaddr;
+	fPicture[1] = (uint8_t *) fSecondMap->getVirtualAddress();
+	fPicturePhys[1] = kSecondPicturePhys;
+	for (uint32_t y = 0; y < fPanelHeight; y++) {
+		memcpy(fPicture[1] + (size_t) y * fRowBytes, fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+	}
+	char line[200];
+
+	if (!flipTo(1, &there) || !flipTo(0, &back)) {
+		snprintf(line, sizeof(line), "MiniIOMobileFramebuffer: the display engine does not take a flip within %u ms: frames "
+		    "go into the framebuffer as before\n", kFlipWaitMs);
+		redwood_dpu_say(line);
+		return;
+	}
+	fFlips = true;
+	snprintf(line, sizeof(line), "MiniIOMobileFramebuffer: frames go to the panel by flips between %#llx and %#llx (the "
+	    "engine took the first two in %llu and %llu us)\n", fPicturePhys[0], fPicturePhys[1], there, back);
+	redwood_dpu_say(line);
 }
 
 /* Keep a small copy of the frame that is about to be shown (the surface is the whole screen). */
@@ -615,7 +716,7 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
 		if (y < 0 || (uint32_t) y >= fPanelHeight) {
 			continue;
 		}
-		to = (uint32_t *) (fBase + (size_t) y * fRowBytes);
+		to = (uint32_t *) (fDraw + (size_t) y * fRowBytes);
 		if (job->unscaled) {
 			/* not scaled at all */
 			memcpy(to + px0, pixels + (size_t) (sy + y - py0) * stride + (size_t) sx * 4, (size_t) sw * 4);
@@ -705,6 +806,8 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 		y1 = job->py0 + (int32_t) ((int64_t) rows * (index + 2) / fb->fThreads);
 		blend = fb->fHelperBlend[index];
 		fb->drawRows(job, y0, y1, blend);
+		/* (with flips) these rows in memory before the engine may be pointed at them: not in this core's write buffers */
+		__asm__ volatile ("dsb sy" ::: "memory");
 		IOLockLock(fb->fHelperLock);
 		fb->fHelpersBusy--;
 		if (fb->fHelpersBusy == 0) {
@@ -717,9 +820,9 @@ IOMobileFramebuffer::helperMain(void * self, wait_result_t result __unused)
 /*
  * Put a rectangle of a 32-bit surface on the screen. `dst` is in display coordinates; the
  * panel may be of another size, and the layer itself may be scaled: both are done in one
- * step, bilinear (or nearest neighbour: fb_filter=0).
+ * step, bilinear (or nearest neighbour: fb_filter=0). False if nothing was drawn.
  */
-void
+bool
 IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int32_t * dst)
 {
 	int32_t sx = src[0], sy = src[1], sw = src[2], sh = src[3];
@@ -739,7 +842,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		dh = (int32_t) fHeight;
 	}
 	if (sx < 0 || sy < 0 || (uint32_t) (sx + sw) > s->info.width || (uint32_t) (sy + sh) > s->info.height) {
-		return;
+		return false;
 	}
 	/* the rectangle on the panel */
 	px0 = (int32_t) ((int64_t) dx * fPanelWidth / fWidth);
@@ -747,7 +850,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	px1 = (int32_t) ((int64_t) (dx + dw) * fPanelWidth / fWidth);
 	py1 = (int32_t) ((int64_t) (dy + dh) * fPanelHeight / fHeight);
 	if (px1 <= px0 || py1 <= py0) {
-		return;
+		return false;
 	}
 	/* (blending, a row of the picture mixed from two: room for it, for every one who draws rows) */
 	if (filter && fBlendRowSize < (uint32_t) sw) {
@@ -802,7 +905,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 	job.unscaled = px1 - px0 == sw && py1 - py0 == sh && px0 >= 0 && (uint32_t) px1 <= fPanelWidth;
 	if (fThreads <= 1 || fDiff || fHelpersStarted + 1 < fThreads) {
 		drawRows(&job, py0, py1, fBlendRow);
-		return;
+		return true;
 	}
 	/* shared out: the helpers take their rows, this thread the first share, then waits for them */
 	IOLockLock(fHelperLock);
@@ -817,6 +920,7 @@ IOMobileFramebuffer::drawLayer(MiniIOSurface * s, const int32_t * src, const int
 		IOLockSleep(fHelperLock, &fHelpersBusy, THREAD_UNINT);
 	}
 	IOLockUnlock(fHelperLock);
+	return true;
 }
 
 /*
@@ -935,7 +1039,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
 	uint32_t layers = 0;
 	MiniIOSurface * recorded = NULL;
-	bool report;
+	bool report, whole = false, covered = false;
 
 	for (unsigned layer = 0; layer < SWAP_LAYERS; layer++) {
 		if (surfaces[layer] != NULL && !MiniIOSurfaceDrawn(surfaces[layer], SWAP_GPU_MS)) {
@@ -970,6 +1074,21 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		}
 	}
 	shown = began;
+	if (fFlips) {
+		/*
+		 * Into the picture the engine is not reading, when the bottom layer covers all of the panel
+		 * (or takes it away: the panel goes black); otherwise on the one it reads, as before flips.
+		 */
+		int32_t d[4];
+		MiniIOSurface * bottom = surfaces[0];
+
+		memcpy(d, swap + SWAP_DEST(0), sizeof(d));
+		whole = swapWord(swap, SWAP_SURFACE(0)) == 0 ? (set & 1) && fGraphics :
+		    bottom != NULL && bottom->info.bytesPerElement == 4 && bottom->info.planeCount == 0 &&
+		    (d[2] <= 0 || d[3] <= 0 || (d[0] <= 0 && d[1] <= 0 && d[0] + d[2] >= (int32_t) fWidth &&
+		    d[1] + d[3] >= (int32_t) fHeight));
+		fDraw = fPicture[whole ? 1 - fShowing : fShowing];
+	}
 	/* its turn has come: the swap after it may be handed over */
 	IOLockLock(fSwapLock);
 	fSwapFirst = (fSwapFirst + 1) % SWAP_QUEUE;
@@ -1011,8 +1130,9 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 			/* the bottom layer taken away: nothing is shown, the screen is black */
 			if (layer == 0 && (set & 1) && fGraphics) {
 				for (uint32_t y = 0; y < fPanelHeight; y++) {
-					bzero(fBase + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
+					bzero(fDraw + (size_t) y * fRowBytes, (size_t) fPanelWidth * 4);
 				}
+				covered = true;
 			}
 			continue;
 		}
@@ -1036,10 +1156,26 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 				fGraphics = true;
 				PE_initialize_console(NULL, kPEGraphicsMode);
 			}
-			drawLayer(s, src, dst);
+			if (drawLayer(s, src, dst) && layer == 0) {
+				covered = true;
+			}
 			if (layer == 0) {
 				recorded = s;   /* (recorded once the frame is in the panel's memory: see below) */
 			}
+		}
+	}
+	if (fFlips && whole && covered) {
+		uint64_t waited;
+
+		/* the engine to the new picture, and this frame done once it reads it: the next is drawn into the other */
+		if (flipTo(1 - fShowing, &waited)) {
+			fStatFlips++;
+			fStatFlipWait += waited;
+		} else {
+			IOLog("MiniIOMobileFramebuffer: the display engine has not taken a flip in %u ms: frames go into the "
+			    "framebuffer from now on\n", kFlipWaitMs);
+			fFlips = false;
+			fDraw = fBase;
 		}
 	}
 	drawn = mach_absolute_time();
@@ -1074,10 +1210,12 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
 		absolutetime_to_nanoseconds(fStatBeatWait, &beat);
 		IOLog("MiniIOMobileFramebuffer: %u frames in %llu ms (%llu a second), %llu us each in the driver, after %llu us "
 		    "waiting for the GPU and, %u of them, %llu us for the next refresh; %u swaps waited for the frame before, "
-		    "%u gave up; %u swaps came a refresh late themselves\n", fStatFrames, nanos / NSEC_PER_MSEC,
-		    fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
+		    "%u gave up; %u swaps came a refresh late themselves; %u flips, %llu us each until the engine took it\n",
+		    fStatFrames, nanos / NSEC_PER_MSEC, fStatFrames * NSEC_PER_SEC / nanos, drawing / fStatFrames / NSEC_PER_USEC,
 		    waiting / fStatFrames / NSEC_PER_USEC, fStatOnBeat, fStatOnBeat ? beat / fStatOnBeat / NSEC_PER_USEC : 0,
-		    fStatHeld, fStatLost, fStatSwapsLate);
+		    fStatHeld, fStatLost, fStatSwapsLate, fStatFlips, fStatFlips ? fStatFlipWait / fStatFlips : 0);
+		fStatFlips = 0;
+		fStatFlipWait = 0;
 		fStatSwapsLate = 0;
 		for (different = 0; different < 8 && fStatSurfaces[different] != 0; different++) {
 		}

@@ -45,6 +45,7 @@ extern void gic_v3_irq_cpu_shutdown(void);
 void loader_log_putc(char c);
 void loader_return(void);
 extern void redwood_adreno_quiesce(void);
+extern void redwood_dpu_restore(void);
 extern void redwood_adreno_stop(void);
 extern void redwood_adreno_minute(void);
 extern void redwood_wifi_stop(void);
@@ -371,6 +372,7 @@ loader_return(void)
 #endif
 	redwood_ufs_quiesce();          /* this kernel's requests to the storage done, UEFI's list as it was, for the log */
 	redwood_adreno_quiesce();       /* the GPU block, if it was started, has tables in memory that is about to be reused */
+	redwood_dpu_restore();          /* (lemonadep) the panel shows the boot framebuffer again, the one the loader draws into */
 	redwood_wifi_quiesce();         /* the Wi-Fi DSP, if it still runs (a panic), is not left to itself */
 	redwood_adsp_quiesce();         /* nor the audio DSP */
 	redwood_ddr_quiesce();          /* and the vote for the memory's bandwidth taken away */
