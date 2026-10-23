@@ -15,6 +15,10 @@
  *              line are held low by the unpowered chip)
  *   size       1440 x 3216 (touchpanel,panel-coords), the same as the panel's
  * Seen 2026-10-22: part "s3908-15.0.0", TouchComm 1, application firmware; max x 1439, max y 3215.
+ * Until 2026-10-23 gpio31 was never driven (power_sequence stopped once the bus came up on the
+ * 1.8 V side): the chip identified itself and answered every command, but its touch reports were
+ * mostly ghosts and broken-up fingers. Both enables are now driven high, 2.8 V first, as OnePlus's
+ * driver does (syna_power_control) and as popovluka/ios-lemonadep's does, whose touch worked first.
  * There is no pin, regulator or I2C framework in this kernel. The bus is driven by hand: open
  * drain, a line is pulled low by making its pin an output at 0 and let go by making it an input
  * with its pull-up; the clock line is waited for when let go (the chip may hold it low).
@@ -23,23 +27,28 @@
  * length and the payload. The chip answers with messages: 0xa5, a status or report code, a 16-bit
  * length, the payload, 0x5a; a message longer than one read is fetched by "continued reads" that
  * start with 0xa5 0x03. After a reset the chip sends an identify report (0x10) by itself; touches
- * come as touch reports (0x11), whose layout the chip describes when asked (a list of fields and
- * their widths in bits, read least significant bit first). NOTHING THAT WRITES THE CHIP'S FLASH OR
- * ITS CONFIGURATION IS EVER SENT: identify, application info, touch report layout and enabling the
- * touch report are the only commands.
+ * come as touch reports (0x11) in a layout the host sets: a list of fields and their widths in
+ * bits, read least significant bit first. The layout set here is ios-lemonadep's: for each active
+ * object its index (8 bits), x and y (16 bits each), 5 bytes a finger (the chip's own has 12 bytes
+ * a finger after a 7-byte header; it is read and used if the chip refuses ours). NOTHING THAT
+ * WRITES THE CHIP'S FLASH IS EVER SENT (no flash command, no COMMIT_CONFIG): the layout, the report
+ * switch and what OnePlus's driver tells the chip after every reset (dynamic settings and a rezero:
+ * see tell_conditions) are all forgotten when the chip resets.
  *
  * Steps, each said in the log before it is taken (boot-arg touch_steps=N stops after the first N):
  *   1  read how the six pins are set up, and where RPMh keeps ldoc3          (reads only)
- *   2  take the pins; with boot-arg touch_power=1 also switch the supplies on (RPMh and two pins),
- *      looking at the lines after each
+ *   2  take the pins; with boot-arg touch_power=1 also switch the supplies on (RPMh and two pins)
  *   3  reset the chip and read the first message (the identify report)
- *   4  ask for the application info and the touch report layout
- *   5  watch the interrupt line, 250 times a second, and turn reports into touches (the default)
+ *   4  ask for the application info, set the touch report layout, switch touch reports on and
+ *      tell the chip its conditions (boot-arg touch_tell=0: not)
+ *   5  watch the interrupt line, 500 times a second, and turn reports into touches (the default)
  * Boot-arg touch_flip: bit 0 mirrors x, bit 1 mirrors y.
  *
  * Protocol: Synaptics' TouchComm drivers for Android (synaptics_tcm: tcm_core, touch report
- * parsing); RPMh, the command database and the pins as in bsd/dev/redwood_goodix.c (Linux
- * drivers/soc/qcom/{rpmh-rsc,cmd-db}.c, drivers/pinctrl/qcom/pinctrl-msm.c).
+ * parsing), and popovluka/ios-lemonadep's lemonadep/xnu/patches/1005-lemonadep-touch-tcm.patch
+ * (report layout, message framing, bus timing); RPMh, the command database and the pins as in
+ * bsd/dev/redwood_goodix.c (Linux drivers/soc/qcom/{rpmh-rsc,cmd-db}.c,
+ * drivers/pinctrl/qcom/pinctrl-msm.c).
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
@@ -51,6 +60,7 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern kern_return_t thread_terminate(thread_t thread);
+extern void redwood_tl(const char *format, ...) __printflike(1, 2);
 
 /*
  * Every line goes to the loader's log directly as well (as in redwood_buttons.c): the kernel's
@@ -132,6 +142,7 @@ spin_ns(uint32_t ns)
 #define PIN_INT                 23      /* low = the chip has a message */
 #define PIN_ENABLE_2V8          31      /* high = on */
 #define PIN_ENABLE_1V8          197     /* high = on */
+#define PIN_TE                  82      /* the panel's tearing-effect signal ("mdp_vsync"): a pulse a frame; only read */
 
 /*
  * A pin that can be the audio island's ("eGPIO", bit 11 set: gpio197, the touch's 1.8 V enable,
@@ -314,46 +325,6 @@ ldoc3_on(uint32_t ldo)
 	return rpmh_write(address, data, 3);
 }
 
-/*
- * Does GPIO 197's pad follow this controller? As an input with its pull-up it reads 1 when it does.
- * (It read 0 until the pin was claimed from the audio island: see gpio_configure.)
- */
-static bool
-gpio197_bank_powered(const char *when)
-{
-	bool level;
-
-	gpio_configure(PIN_ENABLE_1V8, 0, PULL_UP, 2, false);
-	sleep_ms(1);
-	level = gpio_get(PIN_ENABLE_1V8);
-	printf("synaptics: gpio197 as an input with its pull-up, %s: reads %u (%s)\n", when, level,
-	    level ? "the pad follows" : "the pad does NOT follow: still the island's, or held low");
-	return level;
-}
-
-/*
- * What a PM8350C regulator really is (slave 2, LDO n = peripheral 0x40 + n - 1), read from the PMIC:
- * status 0x08 (bit 7: ready), 0x40/0x41 the set voltage in mV, 0x45 mode, 0x46 bit 7 enabled.
- */
-static void
-say_ldo(unsigned n)
-{
-	uint16_t id = (uint16_t)(0x200 | (0x40 + n - 1));
-	uint8_t status = 0, v[8] = { 0 };
-	const char *problem = redwood_spmi_peek(id, 0x08, &status, 1);
-
-	if (problem == NULL) {
-		problem = redwood_spmi_peek(id, 0x40, v, 8);
-	}
-	if (problem != NULL) {
-		printf("synaptics: PM8350C LDO%u: %s\n", n, problem);
-		return;
-	}
-	printf("synaptics: PM8350C LDO%u: %s, %s, %u mV (status %#x, mode %#x, enable %#x)\n", n,
-	    (v[6] & 0x80) ? "enabled" : "not enabled", (status & 0x80) ? "ready" : "not ready", v[0] | v[1] << 8, status,
-	    v[5], v[6]);
-}
-
 /* the chip's three open-drain lines: all high once its I/O supply is up (they are pulled up to it) */
 static bool
 say_lines(const char *when)
@@ -365,71 +336,54 @@ say_lines(const char *when)
 }
 
 /*
- * The supplies, a step at a time, with the lines looked at after each: the bus and the interrupt
- * line read low for as long as the chip's I/O supply is off (an unpowered chip clamps them).
- * The device tree marks both enable pins active-low, the vendor's driver drives them high: high
- * first, then low if the bus stayed down, and back to high if neither did anything.
+ * The supplies, in the order OnePlus's driver switches them on (syna_power_control): 2.8 V (ldoc3
+ * through RPMh, then its enable, gpio31), then 1.8 V (gpio197), then 10 ms before the reset is let
+ * go (POWEWRUP_TO_RESET_TIME). Both enables are let go first, for 100 ms: the pins keep their state
+ * through a reboot, so a run after another finds the chip as that one left it. The bus and the
+ * interrupt line read low for as long as the chip's I/O supply is off (an unpowered chip clamps
+ * them).
  */
 static void
 power_sequence(uint32_t ldo)
 {
-	say_ldo(3);
+	gpio_output(PIN_ENABLE_1V8, false, PULL_NONE, 2);
+	gpio_output(PIN_ENABLE_2V8, false, PULL_NONE, 2);
+	sleep_ms(100);
+	say_lines("both enables low");
 	if (ldo == 0 || (ldo >> 16 & 0xf) != 4) {
 		printf("synaptics: ldoc3 is not a regulator in RPMh (%#x): left alone\n", ldo);
 	} else if (!ldoc3_on(ldo)) {
 		printf("synaptics: the RPMh request for ldoc3 did not complete\n");
 	}
-	sleep_ms(5);
-	say_ldo(3);
-	if (say_lines("ldoc3 on")) {
-		return;
-	}
-	gpio197_bank_powered("claimed");
-	gpio_output(PIN_ENABLE_1V8, true, PULL_NONE, 2);
-	sleep_ms(5);
-	if (say_lines("and gpio197 high")) {
-		return;
-	}
 	gpio_output(PIN_ENABLE_2V8, true, PULL_NONE, 2);
-	sleep_ms(5);
-	if (say_lines("and gpio31 high")) {
-		return;
-	}
+	gpio_output(PIN_ENABLE_1V8, true, PULL_NONE, 2);
+	sleep_ms(10);
 	say_pin(PIN_ENABLE_2V8, "2.8 V enable");
 	say_pin(PIN_ENABLE_1V8, "1.8 V enable");
-	gpio_set(PIN_ENABLE_1V8, false);
-	sleep_ms(5);
-	if (say_lines("gpio197 low instead")) {
-		return;
+	if (!say_lines("both supplies on")) {
+		printf("synaptics: the bus is still held low\n");
 	}
-	gpio_set(PIN_ENABLE_2V8, false);
-	sleep_ms(5);
-	if (say_lines("and gpio31 low")) {
-		return;
-	}
-	gpio_set(PIN_ENABLE_1V8, true);
-	gpio_set(PIN_ENABLE_2V8, true);
-	sleep_ms(5);
-	say_lines("both high again (as the vendor's driver leaves them)");
 }
 
 /* ---- I2C by hand ------------------------------------------------------------------------------- */
 
-#define I2C_HALF_NS             2500    /* about 200 kHz */
-#define I2C_STRETCH_US          2000    /* how long the chip may hold the clock low */
+#define I2C_HALF_NS             2500    /* about 200 kHz, as ios-lemonadep's (1250 at 2 mA spoilt 1 message in 75) */
+#define I2C_STRETCH_US          20000   /* how long the chip may hold the clock low */
+#define I2C_MA                  4       /* the lines' drive strength, as ios-lemonadep's */
 
 static uint64_t i2c_nacks, i2c_stretch_timeouts;
 
+/* (the bus pins are no eGPIOs: their configuration is written whole, without reading it first) */
 static void
 line_low(unsigned pin)
 {
-	gpio_configure(pin, 0, PULL_UP, 2, true);       /* the output level is 0 (set once in i2c_take) */
+	wr(GPIO_CFG(pin), PULL_UP | (I2C_MA / 2 - 1) << 6 | CFG_OUTPUT);       /* the output level is 0 (set once in i2c_take) */
 }
 
 static void
 line_release(unsigned pin)
 {
-	gpio_configure(pin, 0, PULL_UP, 2, false);
+	wr(GPIO_CFG(pin), PULL_UP | (I2C_MA / 2 - 1) << 6);
 }
 
 static bool
@@ -588,6 +542,14 @@ i2c_take(void)
 #define TCM_CMD_ENABLE_REPORT   0x05
 #define TCM_CMD_GET_APP_INFO    0x20
 #define TCM_CMD_GET_TOUCH_REPORT_CONFIG 0x25
+#define TCM_CMD_SET_TOUCH_REPORT_CONFIG 0x26 /* kept until the chip is reset: never its flash */
+#define TCM_CMD_SET_DYNAMIC_CONFIG 0x24 /* a setting the chip keeps until it is reset: never its flash */
+#define TCM_CMD_REZERO          0x27    /* take the present state as "nothing touching" */
+/* dynamic settings: OnePlus's driver for this chip, synaptics_tcm_oncell.[ch] (normal mode, MODE_EDGE, MODE_CHARGE) */
+#define DC_CHARGER_CONNECTED    0x07
+#define DC_IN_WAKEUP_GESTURE_MODE 0x09
+#define DC_GRIP_ENABLED         0xde
+#define DC_SET_REPORT_FRE       0xe6    /* 1: 60 Hz, 3: 90, 2: 120 -- the display's refresh rate */
 #define TCM_MODE_APPLICATION    0x01
 #define TCM_MAX_PAYLOAD         1024
 #define TCM_CHUNK               256     /* bytes of payload fetched by one continued read */
@@ -600,29 +562,33 @@ static uint32_t max_x = 1439, max_y = 3215, max_objects = 10;
 static uint64_t messages, bad_messages;
 
 /*
- * One message from the chip: its code and payload length (0, false: nothing could be read).
- * Status 0 (idle) means the chip had nothing to say.
+ * One message from the chip: its code and payload length (false: nothing could be read). Status 0
+ * (idle) means the chip had nothing to say. Read as ios-lemonadep reads it, never past its end:
+ * the header and one byte more (the first of the payload, or the end marker of an empty message),
+ * then the rest through continued reads, each starting with 0xa5 0x03. (Reading the header together
+ * with as much payload as the last message had, the run of 23 October lost 1 message in 75 and
+ * saw continued reads start 0xa5 0x00.)
  */
 static bool
 tcm_read_message(uint8_t *code, uint32_t *length)
 {
-	uint8_t header[4];
-	uint32_t got = 0, total;
+	uint8_t header[5];
+	uint32_t got, total;
 
 	if (!i2c_read(header, sizeof(header))) {
 		return false;
 	}
 	if (header[0] != TCM_MARKER) {
 		if (bad_messages++ < 8) {
-			printf("synaptics: a message without its marker: %02x %02x %02x %02x\n", header[0], header[1], header[2],
-			    header[3]);
+			printf("synaptics: a message without its marker: %02x %02x %02x %02x\n", header[0], header[1],
+			    header[2], header[3]);
 		}
 		return false;
 	}
 	*code = header[1];
 	*length = header[2] | (uint32_t)header[3] << 8;
-	if (*code == TCM_STATUS_IDLE || *code == TCM_STATUS_BUSY) {
-		*length = 0;
+	if (*code == TCM_STATUS_IDLE || *code == TCM_STATUS_BUSY || *code == TCM_STATUS_CONTINUED) {
+		*length = 0;                    /* no length to go by (as Synaptics' driver reads them) */
 		return true;
 	}
 	if (*length > TCM_MAX_PAYLOAD) {
@@ -631,8 +597,9 @@ tcm_read_message(uint8_t *code, uint32_t *length)
 		}
 		return false;
 	}
-	/* the payload and the end marker, through continued reads (each starts with 0xa5 0x03) */
-	total = *length + 1;
+	total = *length + 1;                    /* the payload and the end marker */
+	got = 1;
+	tcm_payload[0] = header[4];
 	while (got < total) {
 		uint32_t part = total - got < TCM_CHUNK ? total - got : TCM_CHUNK;
 
@@ -688,7 +655,7 @@ say_identify(uint32_t length)
 static int
 tcm_command(uint8_t command, const uint8_t *payload, uint32_t length)
 {
-	uint8_t out[8];
+	uint8_t out[3 + 16];
 	uint8_t code;
 	uint32_t answer;
 
@@ -745,12 +712,37 @@ tcm_command(uint8_t command, const uint8_t *payload, uint32_t length)
 
 #define MAX_OBJECTS                     10
 
+/* the layout asked for (ios-lemonadep's): each active object's index, x and y, in whole bytes */
+static const uint8_t lemonadep_layout[] = {
+	TOUCH_FOREACH_ACTIVE_OBJECT,
+	TOUCH_OBJECT_N_INDEX, 8,
+	TOUCH_OBJECT_N_X_POSITION, 16,
+	TOUCH_OBJECT_N_Y_POSITION, 16,
+	TOUCH_FOREACH_END,
+	TOUCH_END,
+};
+
 static struct object {
 	uint32_t classification, x, y;
+	uint32_t last_x, last_y;        /* where the previous report had it */
+	uint8_t stable;                 /* reports in a row it has been a finger, near where it was */
+	uint8_t missing;                /* reports in a row it has not been, while posted as down */
 	bool seen;              /* in this report */
 	bool down;              /* posted as down and not yet as up */
 } objects[MAX_OBJECTS];
+
+/*
+ * Smoothing, off by default (each report is taken as it is, as ios-lemonadep's driver takes it).
+ * Written for the reports of the runs before gpio31 was driven (22 October: 1232 of 1334
+ * "touches" under 50 ms, at random places all over the panel, real fingers broken into pieces):
+ * with boot-arg touch_settle=N a finger is posted as down only after N reports in a row near one
+ * place, with touch_release=N as up only after N reports in a row without it; touch_jump is how
+ * far, in the chip's units, a finger that is not yet down may move from one report to the next and
+ * still count as settling.
+ */
+static uint32_t settle = 1, release = 1, jump = 150;
 static uint32_t flip;
+static uint32_t dump_left;      /* boot-arg touch_dump=N: the first N touch reports, raw and as parsed */
 static uint64_t touch_reports, downs;
 
 static uint32_t
@@ -820,11 +812,20 @@ parse_touch_report(const uint8_t *data, uint32_t size)
 				return;
 			}
 			bits = report_config[idx++];
+			if (offset + bits > size * 8) {
+				idx = report_config_size;       /* past the report's end: no more objects */
+				break;
+			}
 			value = bits_at(data, size, offset, bits);
 			offset += bits;
 			switch (field) {
 			case TOUCH_OBJECT_N_INDEX:
 				obj = value;
+				if (active_only && obj < MAX_OBJECTS) {
+					/* listed among the active ones: a finger, unless a classification says otherwise */
+					objects[obj].classification = CLASS_FINGER;
+					objects[obj].seen = true;
+				}
 				break;
 			case TOUCH_OBJECT_N_CLASSIFICATION:
 				if (obj < MAX_OBJECTS) {
@@ -852,13 +853,45 @@ parse_touch_report(const uint8_t *data, uint32_t size)
 	}
 
 	touch_reports++;
+	if (dump_left > 0) {
+		char line[400];
+		uint32_t n = 0;
+
+		dump_left--;
+		for (uint32_t i = 0; i < size && i < 48 && n + 4 < sizeof(line); i++) {
+			n += (uint32_t)snprintf(line + n, sizeof(line) - n, "%02x", data[i]);
+		}
+		line[n] = 0;
+		printf("synaptics: report %llu, %u bytes (active %u%s): %s%s\n", touch_reports, size, active,
+		    active_known ? "" : ", not given", line, size > 48 ? "..." : "");
+		for (unsigned i = 0; i < MAX_OBJECTS; i++) {
+			if (objects[i].seen) {
+				printf("synaptics:   object %u class %u at %u, %u\n", i, objects[i].classification, objects[i].x,
+				    objects[i].y);
+			}
+		}
+	}
 	for (unsigned i = 0; i < MAX_OBJECTS; i++) {
 		struct object *o = &objects[i];
 		bool touching = o->seen && (o->classification == CLASS_FINGER || o->classification == CLASS_GLOVED_FINGER);
 
 		if (touching) {
 			uint32_t x = o->x > max_x ? max_x : o->x, y = o->y > max_y ? max_y : o->y;
+			uint32_t moved = (o->x > o->last_x ? o->x - o->last_x : o->last_x - o->x) +
+			    (o->y > o->last_y ? o->y - o->last_y : o->last_y - o->y);
 
+			o->missing = 0;
+			if (!o->down && o->stable > 0 && moved > jump) {
+				o->stable = 0;          /* somewhere else than last time: settling again */
+			}
+			if (o->stable < 255) {
+				o->stable++;
+			}
+			o->last_x = o->x;
+			o->last_y = o->y;
+			if (!o->down && o->stable < settle) {
+				continue;
+			}
 			x = (uint32_t)((uint64_t)x * 65535 / (max_x ? max_x : 1));
 			y = (uint32_t)((uint64_t)y * 65535 / (max_y ? max_y : 1));
 			if (flip & 1) {
@@ -872,14 +905,90 @@ parse_touch_report(const uint8_t *data, uint32_t size)
 				printf("synaptics: finger %u down at %u, %u (of %u, %u)\n", i, o->x, o->y, max_x, max_y);
 			}
 			o->down = true;
-		} else if (o->down) {
-			redwood_touch_post(REDWOOD_TOUCH_UP, i, 0, 0);
-			o->down = false;
+		} else {
+			o->stable = 0;
+			if (o->down && ++o->missing >= release) {
+				redwood_touch_post(REDWOOD_TOUCH_UP, i, 0, 0);
+				o->down = false;
+				o->missing = 0;
+			}
 		}
 	}
 }
 
+/* ---- what the chip is told ---------------------------------------------------------------------- */
+
+static void
+set_dynamic(const char *what, uint8_t id, uint16_t value)
+{
+	uint8_t payload[3] = { id, (uint8_t)value, (uint8_t)(value >> 8) };
+	int answer = tcm_command(TCM_CMD_SET_DYNAMIC_CONFIG, payload, sizeof(payload));
+
+	printf("synaptics: %s (dynamic setting %#x = %#x): %s\n", what, id, value, answer < 0 ? "NOT taken" : "taken");
+}
+
+/*
+ * The display's refresh rate, from its tearing-effect line: a command-mode panel pulses it once a
+ * frame. Counted for a quarter of a second by looking at the pin as fast as it reads (a pulse lasts
+ * some hundred microseconds); 0 when the line does not move.
+ */
+static uint32_t
+display_hz(void)
+{
+	uint64_t ticks, end;
+	uint32_t rises = 0;
+	bool last = gpio_get(PIN_TE);
+
+	nanoseconds_to_absolutetime(250 * NSEC_PER_MSEC, &ticks);
+	end = mach_absolute_time() + ticks;
+	while (mach_absolute_time() < end) {
+		bool level = gpio_get(PIN_TE);
+
+		rises += level && !last;
+		last = level;
+	}
+	return rises * 4;
+}
+
+/*
+ * What OnePlus's driver tells the chip after every reset (ios-lemonadep's tells it none of it):
+ * out of the wake-gesture mode, the report rate that goes with the display's refresh rate, its own
+ * grip suppression on (the panel's edges are curved), and whether a charger is connected (a
+ * charger's noise is what this setting is for; the phone is on USB whenever this runs, boot-arg
+ * touch_charger=0 says otherwise). Then a rezero, with nothing on the panel. All of it is
+ * forgotten when the chip resets; nothing is written to its flash. (Told without gpio31 driven, on
+ * 23 October, it did not quiet the reports.)
+ */
+static void
+tell_conditions(uint32_t charger)
+{
+	uint32_t hz = display_hz();
+
+	set_dynamic("wake-gesture mode off", DC_IN_WAKEUP_GESTURE_MODE, 0);
+	if (hz >= 105) {
+		set_dynamic("reports for a 120 Hz display", DC_SET_REPORT_FRE, 2);
+	} else if (hz >= 75) {
+		set_dynamic("reports for a 90 Hz display", DC_SET_REPORT_FRE, 3);
+	} else if (hz >= 30) {
+		set_dynamic("reports for a 60 Hz display", DC_SET_REPORT_FRE, 1);
+	}
+	printf("synaptics: the display refreshes %u times a second (gpio82)%s\n", hz,
+	    hz < 30 ? ": the report rate is left as it is" : "");
+	set_dynamic("grip suppression on", DC_GRIP_ENABLED, 1);
+	set_dynamic(charger ? "a charger is connected" : "no charger", DC_CHARGER_CONNECTED, charger ? 1 : 0);
+	printf("synaptics: rezero: %s\n", tcm_command(TCM_CMD_REZERO, NULL, 0) < 0 ? "NOT done" : "done");
+}
+
 /* ---- the steps ----------------------------------------------------------------------------------- */
+
+static uint64_t
+micros_now(void)
+{
+	uint64_t ns;
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000;
+}
 
 static void
 say_bytes(const char *what, const uint8_t *data, uint32_t length)
@@ -897,8 +1006,9 @@ say_bytes(const char *what, const uint8_t *data, uint32_t length)
 static void
 synaptics_thread(void *parameter, __unused wait_result_t result)
 {
-	uint32_t steps = (uint32_t)(uintptr_t)parameter, power = 0, poll_us = 4000, ldo;
-	uint8_t code;
+	uint32_t steps = (uint32_t)(uintptr_t)parameter, power = 0, poll_us = 2000, latency = 0, charger = 1, tell = 1, ldo;
+	uint64_t before, batches = 0, reading_us = 0;
+	uint8_t code, report = TCM_REPORT_TOUCH;
 	uint32_t length;
 	int answer;
 	bool identified = false;
@@ -906,6 +1016,13 @@ synaptics_thread(void *parameter, __unused wait_result_t result)
 	PE_parse_boot_argn("touch_power", &power, sizeof(power));
 	PE_parse_boot_argn("touch_poll_us", &poll_us, sizeof(poll_us));
 	PE_parse_boot_argn("touch_flip", &flip, sizeof(flip));
+	PE_parse_boot_argn("touch_settle", &settle, sizeof(settle));
+	PE_parse_boot_argn("touch_release", &release, sizeof(release));
+	PE_parse_boot_argn("touch_jump", &jump, sizeof(jump));
+	PE_parse_boot_argn("touch_charger", &charger, sizeof(charger));
+	PE_parse_boot_argn("touch_tell", &tell, sizeof(tell));
+	PE_parse_boot_argn("touch_dump", &dump_left, sizeof(dump_left));
+	PE_parse_boot_argn("touch_lat", &latency, sizeof(latency));
 
 	printf("synaptics: step 1: the pins as the firmware left them, and where RPMh keeps ldoc3\n");
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
@@ -929,9 +1046,8 @@ synaptics_thread(void *parameter, __unused wait_result_t result)
 	gpio_configure(PIN_INT, 0, PULL_NONE, 2, false);
 	i2c_take();
 	say_lines("before any supply");
-	say_ldo(1);
-	say_ldo(8);
 	if (power) {
+		gpio_output(PIN_RESET, false, PULL_NONE, 2);    /* in reset while the supplies come up */
 		power_sequence(ldo);
 	}
 	i2c_take();
@@ -974,7 +1090,8 @@ synaptics_thread(void *parameter, __unused wait_result_t result)
 		goto out;
 	}
 
-	printf("synaptics: step 4: the application info and the touch report layout\n");
+	printf("synaptics: step 4: the application info, the touch report layout, touch reports on%s\n",
+	    tell ? ", the chip's conditions" : "");
 	answer = tcm_command(TCM_CMD_GET_APP_INFO, NULL, 0);
 	if (answer >= 38) {
 		uint32_t x = tcm_payload[32] | tcm_payload[33] << 8, y = tcm_payload[34] | tcm_payload[35] << 8;
@@ -992,40 +1109,58 @@ synaptics_thread(void *parameter, __unused wait_result_t result)
 	} else if (answer >= 0) {
 		say_bytes("application info, shorter than expected", tcm_payload, (uint32_t)answer);
 	}
-	answer = tcm_command(TCM_CMD_GET_TOUCH_REPORT_CONFIG, NULL, 0);
-	if (answer <= 0 || (uint32_t)answer > sizeof(report_config)) {
-		printf("synaptics: no touch report layout (%d): no touch screen\n", answer);
-		goto out;
+	if (tcm_command(TCM_CMD_SET_TOUCH_REPORT_CONFIG, lemonadep_layout, sizeof(lemonadep_layout)) >= 0) {
+		report_config_size = sizeof(lemonadep_layout);
+		memcpy(report_config, lemonadep_layout, report_config_size);
+		say_bytes("touch report layout set", report_config, report_config_size);
+	} else {
+		answer = tcm_command(TCM_CMD_GET_TOUCH_REPORT_CONFIG, NULL, 0);
+		if (answer <= 0 || (uint32_t)answer > sizeof(report_config)) {
+			printf("synaptics: no touch report layout (%d): no touch screen\n", answer);
+			goto out;
+		}
+		report_config_size = (uint32_t)answer;
+		memcpy(report_config, tcm_payload, report_config_size);
+		say_bytes("ours refused; the chip's own touch report layout", report_config, report_config_size);
 	}
-	report_config_size = (uint32_t)answer;
-	memcpy(report_config, tcm_payload, report_config_size);
-	say_bytes("touch report layout", report_config, report_config_size);
-	{
-		uint8_t report = TCM_REPORT_TOUCH;
-
-		answer = tcm_command(TCM_CMD_ENABLE_REPORT, &report, 1);
-		printf("synaptics: touch reports enabled (%d)\n", answer);
+	answer = tcm_command(TCM_CMD_ENABLE_REPORT, &report, 1);
+	printf("synaptics: touch reports on: %s\n", answer < 0 ? "not acknowledged (they usually are already)" : "yes");
+	if (tell) {
+		tell_conditions(charger);
 	}
 	if (steps < 5) {
 		goto out;
 	}
 
 	printf("synaptics: step 5: watching the interrupt line every %u us\n", poll_us);
+	before = micros_now();
 	for (uint64_t tick = 1;; tick++) {
-		for (int n = 0; n < 4 && !gpio_get(PIN_INT); n++) {
-			if (!tcm_read_message(&code, &length)) {
-				break;
+		uint64_t looked = micros_now(), read_at;
+
+		if (!gpio_get(PIN_INT)) {
+			for (int n = 0; n < 8 && !gpio_get(PIN_INT); n++) {
+				if (!tcm_read_message(&code, &length)) {
+					break;
+				}
+				if (code == TCM_REPORT_TOUCH) {
+					parse_touch_report(tcm_payload, length);
+				} else if (code == TCM_REPORT_IDENTIFY) {
+					/* the chip has reset itself: say so; the layout stays */
+					say_identify(length);
+				}
 			}
-			if (code == TCM_REPORT_TOUCH) {
-				parse_touch_report(tcm_payload, length);
-			} else if (code == TCM_REPORT_IDENTIFY) {
-				/* the chip has reset itself: say so; the layout stays */
-				say_identify(length);
+			read_at = micros_now();
+			batches++;
+			reading_us += read_at - looked;
+			if (latency) {
+				redwood_tl("tl: c before %llu seen %llu read %llu\n", before, looked, read_at);
 			}
 		}
+		before = looked;
 		if (tick % (60000000 / (poll_us ? poll_us : 1)) == 0) {
 			printf("synaptics: %llu touch reports, %llu messages (%llu bad), %llu reads not acknowledged, "
-			    "%llu clock waits too long\n", touch_reports, messages, bad_messages, i2c_nacks, i2c_stretch_timeouts);
+			    "%llu clock waits too long; %llu us reading per look that found the line low\n", touch_reports,
+			    messages, bad_messages, i2c_nacks, i2c_stretch_timeouts, batches ? reading_us / batches : 0);
 		}
 		sleep_us(poll_us);
 	}
