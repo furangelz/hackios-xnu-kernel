@@ -20,19 +20,25 @@
  * this phone, 22 October): the display clock controller's bus clock in GCC, and the bus clock of
  * the display block's registers; each is turned on if it is off, nothing else is written.
  *
+ * The panel's brightness (redwood_dpu_backlight(), for MiniIOMobileFramebuffer.cpp's backlight;
+ * boot-arg backlight=1): the DCS command 0x51 to the panel through DSI0. See below.
+ *
  * Addresses: the vendor's device tree (lahaina-sde-common.dtsi: mdp_phys 0xae00000, the blocks'
  * offsets) and Linux's catalog for this SoC (drivers/gpu/drm/msm/disp/dpu1/catalog/
  * dpu_7_0_sm8350.h: the same offsets from the engine at 0xae01000); register layouts from Linux's
  * dpu_hw_{sspp,ctl,intf,lm}.c; clocks from the vendor's dispcc-lahaina.c and gcc-lahaina.c.
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
+#include <sys/errno.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
+extern void MiniIOMobileFramebufferBacklight(void);    /* iokit/Kernel/MiniIOMobileFramebuffer.cpp: iOS's backlight service */
 
 void redwood_dpu_init(void);
 bool redwood_dpu_ready(void);
@@ -40,6 +46,8 @@ void redwood_dpu_flip(uint64_t phys);
 bool redwood_dpu_flipped(void);
 void redwood_dpu_restore(void);
 void redwood_dpu_say(const char *line);
+bool redwood_dpu_backlight_ready(void);
+int redwood_dpu_backlight(uint32_t level);
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -333,12 +341,223 @@ redwood_dpu_say(const char *line)
 	printf("%s", line);
 }
 
+/* ---- the panel's brightness -------------------------------------------------------------------- */
+
+/*
+ * The panel (Samsung AMB670YF01, on DSI0) takes its brightness as the DCS command 0x51 with a
+ * 12-bit level, high byte first: 1..0x7ff, and above that its high-brightness range, which is not
+ * used here (the vendor's dtbo: bl_ctrl_dcs, bl-min-level 1, bl-normal-max-level 0x7ff,
+ * brightness-default-level 0x190, where the boot loader leaves it).
+ *
+ * DSI0's command engine sends it while the display engine goes on sending frames: the controller
+ * puts a command packet between the packets of a frame if it must (the interleave setting in
+ * DSI_COMMAND_MODE_MDP_CTRL), and here it is started when no frame is being sent (DSI_STATUS),
+ * if that comes within 20 ms. The packet goes through the FIFO of the controller's test-pattern
+ * block, as the vendor's dsi_ctrl_hw_cmn_kickoff_fifo_command() does it: nothing in memory for the
+ * controller to fetch, so nothing the display's SMMU has to let it read. In high-speed mode, as
+ * commands go while the display is on. Registers: the vendor's dsi_ctrl_reg.h (techpack/display/
+ * msm/dsi); the packet as its dsi_ctrl_copy_and_pad_cmd() lays one out: word count, data type,
+ * flags (last packet, long packet), the bytes, 0xff up to a whole word.
+ *
+ * Boot-arg backlight=1 (MiniIOMobileFramebuffer.cpp gives iOS a backlight then). Boot-arg
+ * backlight_test=1: at boot, the panel dim (0x40), bright (0x7ff), then as it was, 1.5 s each.
+ */
+#define DSI0_PHYS                       0x0ae94000UL
+#define DSI_SIZE                        0x400
+#define DSI_HW_VERSION                  0x000
+#define DSI_CTRL                        0x004
+#define DSI_STATUS                      0x008
+#define DSI_COMMAND_MODE_DMA_CTRL       0x03c
+#define DSI_COMMAND_MODE_MDP_CTRL       0x040
+#define DSI_DMA_CMD_LENGTH              0x04c
+#define DSI_ACK_ERR_STATUS              0x068
+#define DSI_TRIG_CTRL                   0x084
+#define DSI_CMD_MODE_DMA_SW_TRIGGER     0x090
+#define DSI_LANE_STATUS                 0x0a8
+#define DSI_INT_CTRL                    0x110
+#define DSI_CLK_CTRL                    0x11c
+#define DSI_TEST_PATTERN_GEN_CTRL       0x15c
+#define DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL 0x17c
+#define DSI_TPG_DMA_FIFO_STATUS         0x1dc
+#define DSI_TPG_DMA_FIFO_RESET          0x1ec
+#define DSI_CTRL_ENABLE                 (1u << 0)
+#define DSI_CTRL_CMD_MODE               (1u << 2)
+#define DSI_STATUS_DMA_BUSY             (1u << 1)
+#define DSI_STATUS_MDP_BUSY             (1u << 2)
+#define DMA_CTRL_LOW_POWER              (1u << 26)
+#define DMA_CTRL_EMBEDDED               (1u << 28)
+#define DMA_CTRL_BROADCAST              (3u << 30)
+#define TRIG_DMA                        0xfu            /* DSI_TRIG_CTRL: what starts a command: 4, the software */
+#define TRIG_DMA_SW                     0x4u
+#define INT_CMD_DMA_DONE                (1u << 0)
+#define INT_ERROR                       (1u << 24)
+#define TPG_CMD_DMA_FIFO                (1u << 1 | 1u << 2 | 3u << 16)  /* the command engine takes its packet from the FIFO */
+#define DCS_SET_DISPLAY_BRIGHTNESS      0x51
+#define BACKLIGHT_MAX                   0x7ff
+#define BACKLIGHT_BOOT                  0x190
+
+static vm_offset_t dsi;
+static bool backlight_ok;
+static uint32_t backlight_level = BACKLIGHT_BOOT;       /* what the panel was last told */
+static uint32_t backlight_sent, backlight_failed;
+static uint32_t backlight_lowest = BACKLIGHT_MAX, backlight_highest;     /* of the levels sent */
+static LCK_GRP_DECLARE(backlight_lock_group, "redwood-backlight");
+static LCK_MTX_DECLARE(backlight_lock, &backlight_lock_group);
+
+static void
+dsi_fifo_reset(void)
+{
+	wr(dsi + DSI_TEST_PATTERN_GEN_CTRL, 0);
+	wr(dsi + DSI_TPG_DMA_FIFO_RESET, 1);
+	delay(1);
+	wr(dsi + DSI_TPG_DMA_FIFO_RESET, 0);
+}
+
+/* 0x51 with `level` to the panel; 0 once the controller says the packet is out, else what went wrong. */
+static int
+dcs_brightness(uint32_t level, uint32_t *waited_us)
+{
+	uint64_t began = mach_absolute_time(), now;
+	unsigned i;
+	int done;
+
+	for (i = 0; i < 400 && (rd(dsi + DSI_STATUS) & (DSI_STATUS_MDP_BUSY | DSI_STATUS_DMA_BUSY)); i++) {
+		delay(50);
+	}
+	if (rd(dsi + DSI_STATUS) & DSI_STATUS_DMA_BUSY) {
+		return EBUSY;                   /* the last command is still going: not two at once */
+	}
+	dsi_fifo_reset();
+	wr(dsi + DSI_INT_CTRL, (rd(dsi + DSI_INT_CTRL) & ~INT_ERROR) | INT_CMD_DMA_DONE);       /* an old "done" away */
+	wr(dsi + DSI_TEST_PATTERN_GEN_CTRL, TPG_CMD_DMA_FIFO);
+	wr(dsi + DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, 0xc0u << 24 | 0x39u << 16 | 3u);        /* 03 00 39 c0: 3 bytes, DCS long write, last */
+	wr(dsi + DSI_TEST_PATTERN_GEN_CMD_DMA_INIT_VAL, 0xffu << 24 | (level & 0xff) << 16 | (level >> 8 & 0xff) << 8 |
+	    DCS_SET_DISPLAY_BRIGHTNESS);
+	wr(dsi + DSI_COMMAND_MODE_DMA_CTRL, (rd(dsi + DSI_COMMAND_MODE_DMA_CTRL) & ~(DMA_CTRL_LOW_POWER | DMA_CTRL_BROADCAST)) |
+	    DMA_CTRL_EMBEDDED);
+	wr(dsi + DSI_DMA_CMD_LENGTH, 8);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	wr(dsi + DSI_CMD_MODE_DMA_SW_TRIGGER, 1);
+	for (i = 0; i < 2000 && !(rd(dsi + DSI_INT_CTRL) & INT_CMD_DMA_DONE); i++) {
+		delay(10);
+	}
+	done = rd(dsi + DSI_INT_CTRL) & INT_CMD_DMA_DONE;
+	if (done) {
+		wr(dsi + DSI_INT_CTRL, (rd(dsi + DSI_INT_CTRL) & ~INT_ERROR) | INT_CMD_DMA_DONE);
+	}
+	dsi_fifo_reset();                       /* as the vendor leaves the FIFO after a command */
+	now = mach_absolute_time();
+	if (waited_us != NULL) {
+		uint64_t ns;
+
+		absolutetime_to_nanoseconds(now - began, &ns);
+		*waited_us = (uint32_t)(ns / 1000);
+	}
+	return done ? 0 : ETIMEDOUT;
+}
+
+/* Can the panel's brightness be set (board=lemonadep, backlight=1, DSI0 sending frames in command mode)? */
+bool
+redwood_dpu_backlight_ready(void)
+{
+	return backlight_ok;
+}
+
+/* The panel's brightness: 0 (dark) .. 0x7ff, as DCS 0x51 has it. 0, or why it was not set. */
+int
+redwood_dpu_backlight(uint32_t level)
+{
+	uint32_t waited = 0;
+	int error;
+
+	if (!backlight_ok) {
+		return ENXIO;
+	}
+	if (level > BACKLIGHT_MAX) {
+		level = BACKLIGHT_MAX;
+	}
+	lck_mtx_lock(&backlight_lock);
+	if (level == backlight_level && backlight_sent != 0) {
+		lck_mtx_unlock(&backlight_lock);
+		return 0;
+	}
+	error = dcs_brightness(level, &waited);
+	if (error == 0) {
+		backlight_sent++;
+		backlight_lowest = level < backlight_lowest ? level : backlight_lowest;
+		backlight_highest = level > backlight_highest ? level : backlight_highest;
+		if (backlight_sent <= 8 || backlight_sent % 50 == 0) {
+			printf("dpu: backlight %#x -> %#x (%u us; %u sent, %u failed)\n", backlight_level, level, waited,
+			    backlight_sent, backlight_failed);
+		}
+		backlight_level = level;
+	} else if (backlight_failed++ < 8) {
+		printf("dpu: backlight %#x not sent (error %d after %u us): dsi status %#x int_ctrl %#x ack_err %#x lane_status %#x "
+		    "tpg_fifo %#x\n", level, error, waited, rd(dsi + DSI_STATUS), rd(dsi + DSI_INT_CTRL), rd(dsi + DSI_ACK_ERR_STATUS),
+		    rd(dsi + DSI_LANE_STATUS), rd(dsi + DSI_TPG_DMA_FIFO_STATUS));
+	}
+	lck_mtx_unlock(&backlight_lock);
+	return error;
+}
+
+static void
+dsi_registers(const char *when)
+{
+	printf("dpu: dsi0 %s: hw_version %#x ctrl %#x status %#x dma_ctrl %#x mdp_ctrl %#x trig_ctrl %#x int_ctrl %#x clk_ctrl %#x "
+	    "lane_status %#x ack_err %#x tpg_ctrl %#x tpg_fifo %#x\n", when, rd(dsi + DSI_HW_VERSION), rd(dsi + DSI_CTRL),
+	    rd(dsi + DSI_STATUS), rd(dsi + DSI_COMMAND_MODE_DMA_CTRL), rd(dsi + DSI_COMMAND_MODE_MDP_CTRL), rd(dsi + DSI_TRIG_CTRL),
+	    rd(dsi + DSI_INT_CTRL), rd(dsi + DSI_CLK_CTRL), rd(dsi + DSI_LANE_STATUS), rd(dsi + DSI_ACK_ERR_STATUS),
+	    rd(dsi + DSI_TEST_PATTERN_GEN_CTRL), rd(dsi + DSI_TPG_DMA_FIFO_STATUS));
+}
+
+static void
+backlight_init(void)
+{
+	uint32_t want = 0, ctrl, trig;
+	static const uint32_t test[] = { 0x40, BACKLIGHT_MAX, BACKLIGHT_BOOT };
+
+	if (!PE_parse_boot_argn("backlight", &want, sizeof(want)) || !want || !registers_reachable()) {
+		return;
+	}
+	dsi = ml_io_map(DSI0_PHYS, DSI_SIZE);
+	dsi_registers("as found");
+	ctrl = rd(dsi + DSI_CTRL);
+	if ((ctrl & (DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE)) != (DSI_CTRL_ENABLE | DSI_CTRL_CMD_MODE)) {
+		printf("dpu: dsi0 is not on in command mode (ctrl %#x): no backlight\n", ctrl);
+		return;
+	}
+	trig = rd(dsi + DSI_TRIG_CTRL);
+	if ((trig & TRIG_DMA) != TRIG_DMA_SW) {
+		printf("dpu: dsi0 commands start on %#x, not by software: set\n", trig & TRIG_DMA);
+		wr(dsi + DSI_TRIG_CTRL, (trig & ~TRIG_DMA) | TRIG_DMA_SW);
+	}
+	backlight_ok = true;
+	printf("dpu: the panel's brightness goes by DCS 0x51 through dsi0 (from %#x, the boot loader's)\n", backlight_level);
+	if (PE_parse_boot_argn("backlight_test", &want, sizeof(want)) && want) {
+		for (unsigned i = 0; i < sizeof(test) / sizeof(test[0]); i++) {
+			printf("dpu: backlight_test: %#x\n", test[i]);
+			redwood_dpu_backlight(test[i]);
+			delay(1500 * 1000);
+		}
+		dsi_registers("after the test");
+	}
+	MiniIOMobileFramebufferBacklight();
+}
+
 /* The boot loader's framebuffer on the panel again: for the text console, a panic, the loader. */
 void
 redwood_dpu_restore(void)
 {
 	if (flips_ok && flipped_away) {
 		redwood_dpu_flip(FB_PHYS);
+	}
+	/* and the boot loader's brightness (without the lock: this may be a panic, every other processor stopped) */
+	if (backlight_ok) {
+		printf("dpu: backlight: %u levels sent, %u not, the last %#x (%#x..%#x seen)\n", backlight_sent, backlight_failed,
+		    backlight_level, backlight_lowest, backlight_highest);
+	}
+	if (backlight_ok && backlight_level != BACKLIGHT_BOOT && dcs_brightness(BACKLIGHT_BOOT, NULL) == 0) {
+		backlight_level = BACKLIGHT_BOOT;
 	}
 }
 
@@ -357,4 +576,5 @@ redwood_dpu_init(void)
 			probe();
 		}
 	}
+	backlight_init();
 }

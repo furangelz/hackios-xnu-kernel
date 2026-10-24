@@ -15,6 +15,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOKitKeys.h>
+#include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IODeviceTreeSupport.h>
@@ -26,6 +27,7 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <libkern/c++/OSCollectionIterator.h>
+#include <libkern/c++/OSSerialize.h>
 #include <kern/thread_call.h>
 #include <kern/thread.h>
 #include <kern/clock.h>
@@ -48,6 +50,8 @@ extern "C" bool redwood_dpu_ready(void);
 extern "C" void redwood_dpu_flip(uint64_t phys);
 extern "C" bool redwood_dpu_flipped(void);
 extern "C" void redwood_dpu_say(const char * line);
+extern "C" bool redwood_dpu_backlight_ready(void);
+extern "C" int redwood_dpu_backlight(uint32_t level);
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -326,6 +330,7 @@ public:
 	bool            fRecWrapped;            /* (rec_ring) the memory has been full once: frames go over the oldest */
 
 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
 	void publishModes(void);
 	MiniIOSurface * defaultSurface(void);
 	void present(const uint8_t * swap);
@@ -1746,6 +1751,223 @@ publishAccelerator(IOService * provider)
 		}
 	}
 	OSSafeReleaseNULL(accelerator);
+}
+
+/* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+/*
+ * The panel's brightness (the OnePlus 9 Pro, boot-arg backlight=1; bsd/dev/redwood_dpu.c sends it).
+ *
+ * iOS sets it from CoreBrightness, in backboardd. That looks for the display's backlight among the
+ * services of the class AppleARMBacklight that have backlight-control (-[CBDisplayContaineriOS
+ * findBacklight]), reads its properties (IODisplayParameters, new-backlight-architecture, the
+ * range in nits) and from then on gives every change -- the slider, auto-lock dimming, the ramps
+ * between -- in nits, 16.16 fixed point, twice: as brightness-nits to the backlight and as
+ * IOMFBBrightnessLevel to the framebuffer, the service it opened (iOS 16.5's shared cache: the
+ * function at 0x1aef92830 "Setting BL nits value to %f", then the one at 0x1aefb35d4). Either is
+ * taken here; the second of the two finds the panel already there and costs nothing.
+ *
+ * Nits become the panel's level in a straight line, the most iOS may ask for (user-accessible-max-nits,
+ * kBacklightMaxNits) being the panel's normal top, 0x7ff; nothing goes into its high-brightness range.
+ * (Its levels are close to proportional to light; 500 nits is what OnePlus gives for the normal top.)
+ * 0 nits is dark; anything above 0 is at least the dimmest level.
+ */
+#define kBacklightMaxNits       500
+#define kBacklightMidNits       140
+#define kBacklightMinNits       2
+#define kBacklightLevelMax      0x7ff
+#define kBacklightLevelBoot     0x190           /* where the boot loader leaves the panel */
+
+static uint32_t gBacklightSets, gBacklightNits = ~0u;
+
+static void
+backlightNits(uint32_t nits, const char * key)
+{
+	uint64_t level = ((uint64_t) nits * kBacklightLevelMax + ((uint64_t) kBacklightMaxNits << 15)) /
+	    ((uint64_t) kBacklightMaxNits << 16);
+	int error;
+
+	if (nits != 0 && level == 0) {
+		level = 1;
+	}
+	if (level > kBacklightLevelMax) {
+		level = kBacklightLevelMax;
+	}
+	error = redwood_dpu_backlight((uint32_t) level);
+	if (nits != gBacklightNits && (gBacklightSets++ < 12 || gBacklightSets % 100 == 0)) {
+		char who[32] = "?", line[160];
+
+		proc_selfname(who, sizeof(who));
+		snprintf(line, sizeof(line), "AppleARMBacklight: %s from %s: %u.%02u nits -> level %#llx%s\n", key, who,
+		    nits >> 16, (unsigned) (((nits & 0xffff) * 100) >> 16), level, error != 0 ? " (not sent)" : "");
+		redwood_dpu_say(line);
+	}
+	gBacklightNits = nits;
+}
+
+/* The keys a service was given that it does nothing with, and their values: each key's first few. */
+static void
+backlightUnknownKeys(const char * service, OSDictionary * dict, const char * const * known)
+{
+	static const OSSymbol * seen[24];
+	static uint8_t seenTimes[24];
+	static unsigned seenCount;
+	OSCollectionIterator * keys = OSCollectionIterator::withCollection(dict);
+	OSObject * next;
+	char who[32] = "?";
+
+	if (keys == NULL) {
+		return;
+	}
+	proc_selfname(who, sizeof(who));
+	while ((next = keys->getNextObject()) != NULL) {
+		const OSSymbol * key = OSDynamicCast(OSSymbol, next);
+		OSSerialize * value;
+		char line[300];
+		unsigned i;
+		bool skip = key == NULL;
+
+		for (i = 0; !skip && known[i] != NULL; i++) {
+			skip = key->isEqualTo(known[i]);
+		}
+		if (skip) {
+			continue;
+		}
+		for (i = 0; i < seenCount && seen[i] != key; i++) {
+		}
+		if (i == seenCount) {
+			if (seenCount == sizeof(seen) / sizeof(seen[0])) {
+				continue;
+			}
+			key->retain();
+			seen[seenCount++] = key;
+		}
+		if (seenTimes[i] >= 4) {
+			continue;
+		}
+		seenTimes[i]++;
+		value = OSSerialize::withCapacity(256);
+		if (value != NULL && dict->getObject(key)->serialize(value)) {
+			snprintf(line, sizeof(line), "%s: %s sets %s = %.200s (not used here)\n", service, who, key->getCStringNoCopy(),
+			    value->text());
+		} else {
+			snprintf(line, sizeof(line), "%s: %s sets %s (not used here)\n", service, who, key->getCStringNoCopy());
+		}
+		OSSafeReleaseNULL(value);
+		redwood_dpu_say(line);
+	}
+	keys->release();
+}
+
+IOReturn
+IOMobileFramebuffer::setProperties(OSObject * properties)
+{
+	static const char * const known[] = { "IOMFBBrightnessLevel", NULL };
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
+	OSNumber * nits;
+
+	if (dict == NULL) {
+		return kIOReturnBadArgument;
+	}
+	nits = OSDynamicCast(OSNumber, dict->getObject("IOMFBBrightnessLevel"));
+	if (nits != NULL && redwood_dpu_backlight_ready()) {
+		backlightNits(nits->unsigned32BitValue(), "IOMFBBrightnessLevel");
+	}
+	backlightUnknownKeys("MiniIOMobileFramebuffer", dict, known);
+	return kIOReturnSuccess;
+}
+
+class AppleARMBacklight : public IOService
+{
+	OSDeclareDefaultStructors(AppleARMBacklight);
+
+public:
+	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+};
+
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+
+IOReturn
+AppleARMBacklight::setProperties(OSObject * properties)
+{
+	static const char * const known[] = { "brightness-nits", NULL };
+	OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
+	OSNumber * nits;
+
+	if (dict == NULL) {
+		return kIOReturnBadArgument;
+	}
+	nits = OSDynamicCast(OSNumber, dict->getObject("brightness-nits"));
+	if (nits != NULL) {
+		backlightNits(nits->unsigned32BitValue(), "brightness-nits");
+		setProperty("brightness-nits", nits);
+	}
+	backlightUnknownKeys("AppleARMBacklight", dict, known);
+	return kIOReturnSuccess;
+}
+
+/* bsd/dev/redwood_dpu.c, once it knows the panel's brightness can be set (after this file's start, before user space) */
+extern "C" void
+MiniIOMobileFramebufferBacklight(void)
+{
+	IOService * provider = IOService::getPlatform();
+	AppleARMBacklight * backlight;
+	OSDictionary * parameters, * brightness, * calibration = OSDictionary::withCapacity(10);
+	uint32_t maxNits = kBacklightMaxNits << 16;
+	uint32_t marketing[] = { kBacklightMinNits << 16, kBacklightMidNits << 16, kBacklightMaxNits << 16 };
+
+	if (provider == NULL || !redwood_dpu_backlight_ready()) {
+		return;
+	}
+	backlight = OSTypeAlloc(AppleARMBacklight);
+	parameters = OSDictionary::withCapacity(1);
+	brightness = OSDictionary::withCapacity(3);
+	if (backlight != NULL && parameters != NULL && brightness != NULL && backlight->init()) {
+		setNumber(brightness, "min", 0);
+		setNumber(brightness, "max", kBacklightLevelMax);
+		setNumber(brightness, "value", kBacklightLevelBoot);
+		parameters->setObject("brightness", brightness);
+		backlight->setProperty("IODisplayParameters", parameters);
+		backlight->setProperty("backlight-control", kOSBooleanTrue);
+		backlight->setProperty("new-backlight-architecture", kOSBooleanTrue);
+		backlight->setProperty("user-accessible-max-nits", &maxNits, sizeof(maxNits));  /* (as the device tree has them: 4 bytes) */
+		/*
+		 * The panel's range in nits, darkest, middle, brightest. With the new architecture CoreBrightness
+		 * has no display without it (the constructor at 0x1af075510 gives up); without that, it takes 5, 140, 400.
+		 */
+		backlight->setProperty("backlight-marketing-table", marketing, sizeof(marketing));
+		/*
+		 * The panel's light against what the product promises, darkest, middle, brightest (here the same),
+		 * and the currents of an LED backlight, which this panel does not have (only for power estimates).
+		 * Without these CoreBrightness takes its panel to go from 0 to 1 nit: the constructor works the range
+		 * out through the marketing table before it has read it. Numbers in 16.16 fixed point, as it divides.
+		 */
+		if (calibration != NULL) {
+			setNumber(calibration, "lMinProduct", kBacklightMinNits << 16);
+			setNumber(calibration, "lMidProduct", kBacklightMidNits << 16);
+			setNumber(calibration, "lMaxProduct", kBacklightMaxNits << 16);
+			setNumber(calibration, "lMinPanel", kBacklightMinNits << 16);
+			setNumber(calibration, "lMidPanel", kBacklightMidNits << 16);
+			setNumber(calibration, "lMaxPanel", kBacklightMaxNits << 16);
+			setNumber(calibration, "current-for-max-backlight", 20 << 16);
+			setNumber(calibration, "current-for-mid-backlight", (20 << 16) * kBacklightMidNits / kBacklightMaxNits);
+			setNumber(calibration, "hardware-max-current-limit", 25 << 16);
+			backlight->setProperty("backlight-calibration-parameters", calibration);
+		}
+		if (backlight->attach(provider)) {
+			backlight->setName("backlight");
+			backlight->registerService();
+			char line[120];
+
+			snprintf(line, sizeof(line), "AppleARMBacklight: the panel's brightness, 0..%u nits as levels 0..%#x\n",
+			    kBacklightMaxNits, kBacklightLevelMax);
+			redwood_dpu_say(line);
+		}
+	}
+	OSSafeReleaseNULL(calibration);
+	OSSafeReleaseNULL(brightness);
+	OSSafeReleaseNULL(parameters);
+	OSSafeReleaseNULL(backlight);
 }
 
 /*

@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..6f17b060ad34 100644
+index 44274016a4cf..74843025061d 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,40 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -83,6 +83,7 @@ index 44274016a4cf..6f17b060ad34 100644
 +bsd/dev/redwood_cpufreq.c	standard
 +bsd/dev/redwood_adreno.c	standard
 +bsd/dev/redwood_dpu.c	standard
++bsd/dev/redwood_gauge.c	standard
 +bsd/dev/redwood_audio.c		standard
 +bsd/dev/redwood_virtio_sound.c	standard
 +bsd/dev/redwood_speaker.c	standard
@@ -105,7 +106,7 @@ index 44274016a4cf..6f17b060ad34 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +189,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -120,7 +121,7 @@ index 44274016a4cf..6f17b060ad34 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +402,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +403,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -128,7 +129,7 @@ index 44274016a4cf..6f17b060ad34 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +425,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +426,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -1585,36 +1586,51 @@ index d2442944e5f0..e90ba6738516 100644
  	while (root) {
  		if (root->metaCast(ioblockstoragedriverClass)) {
 diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
-index 07aa0be4a0ca..3832eaff2184 100644
+index 07aa0be4a0ca..a1ddc62acae8 100644
 --- a/iokit/Kernel/IOUserClient.cpp
 +++ b/iokit/Kernel/IOUserClient.cpp
-@@ -3536,6 +3536,25 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
+@@ -3536,6 +3536,40 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
  	return obj;
  }
  
 +/*
 + * Boot-arg regtrace=1: report the registry properties user space asks for and does not
 + * find (regtrace=2: every property asked for). Shows what a daemon expects of a driver.
++ * Boot-arg regtrace_class=NAME: only what is asked of entries of that class, found or not,
++ * and into the loader's log as well (of which a run gives back the first 256 KB and the last 1 MB).
 + */
 +static TUNABLE(uint32_t, regtrace_level, "regtrace", 0);
++static TUNABLE_STR(regtrace_class, 64, "regtrace_class", "");
++extern "C" void loader_log_putc(char c);
 +
 +static void
 +regtrace_report(IORegistryEntry * entry, const char * property, bool found)
 +{
-+	char procname[32] = "?";
++	char procname[32] = "?", line[256];
++	const char * className = entry->getMetaClass()->getClassName();
 +
-+	if (regtrace_level == 0 || (found && regtrace_level < 2)) {
++	if (regtrace_class[0] != 0) {
++		if (strcmp(className, regtrace_class) != 0) {
++			return;
++		}
++	} else if (regtrace_level == 0 || (found && regtrace_level < 2)) {
 +		return;
 +	}
 +	proc_selfname(procname, sizeof(procname));
-+	IOLog("regtrace: %s[%d] %s(%s).%s %s\n", procname, proc_selfpid(), entry->getName(),
-+	    entry->getMetaClass()->getClassName(), property, found ? "found" : "MISSING");
++	snprintf(line, sizeof(line), "regtrace: %s[%d] %s(%s).%s %s\n", procname, proc_selfpid(), entry->getName(),
++	    className, property, found ? "found" : "MISSING");
++	IOLog("%s", line);
++	if (regtrace_class[0] != 0) {
++		for (const char * c = line; *c != 0; c++) {
++			loader_log_putc(*c);
++		}
++	}
 +}
 +
  /* Routine io_registry_entry_get_property */
  kern_return_t
  is_io_registry_entry_get_property_bytes(
-@@ -3563,6 +3582,7 @@ is_io_registry_entry_get_property_bytes(
+@@ -3563,6 +3597,7 @@ is_io_registry_entry_get_property_bytes(
  #endif
  
  	obj = IOCopyPropertyCompatible(entry, property_name);
@@ -1622,7 +1638,7 @@ index 07aa0be4a0ca..3832eaff2184 100644
  	if (!obj) {
  		return kIOReturnNoResources;
  	}
-@@ -3631,6 +3651,7 @@ is_io_registry_entry_get_property(
+@@ -3631,6 +3666,7 @@ is_io_registry_entry_get_property(
  #endif
  
  	obj = IOCopyPropertyCompatible(entry, property_name);
@@ -1630,7 +1646,7 @@ index 07aa0be4a0ca..3832eaff2184 100644
  	if (!obj) {
  		return kIOReturnNotFound;
  	}
-@@ -3679,6 +3700,7 @@ is_io_registry_entry_get_property_recursively(
+@@ -3679,6 +3715,7 @@ is_io_registry_entry_get_property_recursively(
  
  	obj = entry->copyProperty( property_name,
  	    IORegistryEntry::getPlane( plane ), options );
@@ -1638,7 +1654,7 @@ index 07aa0be4a0ca..3832eaff2184 100644
  	if (!obj) {
  		return kIOReturnNotFound;
  	}
-@@ -3873,6 +3895,7 @@ is_io_registry_entry_get_property_bin_buf(
+@@ -3873,6 +3910,7 @@ is_io_registry_entry_get_property_bin_buf(
  	}
  
  	err = kIOReturnNotFound;
@@ -1646,7 +1662,7 @@ index 07aa0be4a0ca..3832eaff2184 100644
  	if (gIORegistryEntryPropertyKeysKey == sym) {
  		obj = entry->copyPropertyKeys();
  	} else {
-@@ -3905,6 +3928,7 @@ is_io_registry_entry_get_property_bin_buf(
+@@ -3905,6 +3943,7 @@ is_io_registry_entry_get_property_bin_buf(
  	}
  
  	sym->release();

@@ -179,8 +179,14 @@ redwood_battery_init(void)
 	uint64_t shared_pa = 0;
 	vm_offset_t page;
 	thread_t thread;
+	char board[32];
 
 	if (!PE_parse_boot_argn("battery", &enabled, sizeof(enabled)) || !enabled) return;
+	if (PE_parse_boot_arg_str("board", board, sizeof(board)) && strcmp(board, "lemonadep") == 0) {
+		/* the 9 Pro: its gauge and charger are on I2C buses of ours, not behind Qualcomm's charger firmware */
+		redwood_gauge_start();
+		return;
+	}
 	if (!PE_parse_boot_argn("battery_shared_pa", &shared_pa, sizeof(shared_pa)) || shared_pa == 0) {
 		printf("battery: xnuloader did not provide battery_shared_pa\n");
 		return;
