@@ -20,7 +20,7 @@
  *   - processor 2 (not 13) in the shared memory; its SMP2P items 443 (its) and 429 (ours), its
  *     last words in item 423; GLINK's three items in our partition with it
  *   - its doorbells are IPCC client 3 (LPASS): signal 0 GLINK, signal 2 SMP2P
- *   - TrustZone knows it as image 1; its memory is 0x86700000, 64 MB (dt: qcom,lpass@3700000,
+ *   - TrustZone knows it as image 1; its memory is 0x86700000, 64 MB (lemonadep: 0x86100000, 33 MB; dt: qcom,lpass@3700000,
  *     reserved-memory adsp@86700000), every byte of which the image takes
  *   - the always-on processor is told of it as "adsp"
  *   - the Wi-Fi DSP may be running at the same time (wifi=1): the mailbox to the always-on
@@ -967,6 +967,7 @@ step_survey(void)
  * (the vendor's lahaina.dtsi, LineageOS android_kernel_oneplus_sm8350).
  */
 static uint32_t adsp_memory = 0x86700000u, adsp_memory_size = 0x04000000u;
+static bool board_lemonadep;
 #define ADSP_MEMORY             adsp_memory
 #define ADSP_MEMORY_SIZE        adsp_memory_size
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
@@ -1063,6 +1064,7 @@ image_file(const char *name, uint64_t *size)
 
 
 #define MDT_HASH(flags)         (((flags) >> 24 & 7) == 2)
+#define MDT_RELOCATABLE         (1u << 27)      /* Linux's QCOM_MDT_RELOCATABLE */
 #define MAX_SEGMENTS            48
 
 struct elf_segment {
@@ -1110,7 +1112,8 @@ step_firmware(void)
 	struct elf_segment segment;
 	const uint8_t *header;
 	uint64_t size = 0, files = 0;
-	uint32_t count, hashes = 0, lowest = ~0u, highest = 0;
+	uint32_t count, hashes = 0, lowest = ~0u, highest = 0, base;
+	bool relocatable = false;
 
 	announce("find the audio DSP's image in the small image or on the root, and check it against its own header");
 	image_forget();
@@ -1127,6 +1130,22 @@ step_firmware(void)
 		    header[1], header[2], header[3], count, size);
 		goto fail;
 	}
+	/*
+	 * Where the segments go. An image whose segments are marked relocatable (bit 27 of their flags, as
+	 * Linux's qcom_mdt_load() has it) goes to the start of the DSP's memory whatever addresses it was
+	 * linked at, its lowest segment first, and TrustZone is told so (step 4): the 9 Pro's is linked at
+	 * 0x87300000 and its memory is 0x86100000. Any other image has to be at the DSP's memory already.
+	 */
+	for (uint32_t i = 0; i < count; i++) {
+		memcpy(&segment, header + 52 + 32 * i, sizeof(segment));
+		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
+			continue;
+		}
+		relocatable = relocatable || (segment.flags & MDT_RELOCATABLE) != 0;
+		lowest = segment.paddr < lowest ? segment.paddr : lowest;
+	}
+	base = relocatable ? lowest : ADSP_MEMORY;
+	lowest = ~0u;
 	for (uint32_t i = 0; i < count; i++) {
 		char name[16];
 
@@ -1137,13 +1156,13 @@ step_firmware(void)
 		if (segment.type != 1 || MDT_HASH(segment.flags) || segment.memory_size == 0) {
 			continue;
 		}
-		if (segment.paddr < ADSP_MEMORY || segment.file_size > segment.memory_size ||
-		    (uint64_t)segment.paddr + segment.memory_size > (uint64_t)ADSP_MEMORY + ADSP_MEMORY_SIZE) {
+		if (segment.paddr < base || segment.file_size > segment.memory_size ||
+		    (uint64_t)segment.paddr - base + segment.memory_size > ADSP_MEMORY_SIZE) {
 			printf("adsp: %u: segment %u (%#x, %#x bytes) is not within the DSP's memory\n", step, i, segment.paddr,
 			    segment.memory_size);
 			goto fail;
 		}
-		image.segment[image.segments].at = segment.paddr - ADSP_MEMORY;
+		image.segment[image.segments].at = segment.paddr - base;
 		image.segment[image.segments].file_size = segment.file_size;
 		image.segment[image.segments].memory_size = segment.memory_size;
 		image.segment[image.segments].file = NULL;
@@ -1166,17 +1185,17 @@ step_firmware(void)
 		highest = segment.paddr + segment.memory_size > highest ? segment.paddr + segment.memory_size : highest;
 		image.segments++;
 	}
-	if (image.segments == 0 || lowest != ADSP_MEMORY || 52 + 32 * count + (uint64_t)hashes != size) {
+	if (image.segments == 0 || lowest != base || 52 + 32 * count + (uint64_t)hashes != size) {
 		printf("adsp: %u: not what TrustZone takes: %u segments to load, the lowest at %#x; the header file has %llu bytes, "
 		    "the header %u and the hashes %u\n", step, image.segments, lowest, size, 52 + 32 * count, hashes);
 		goto fail;
 	}
 	image.header = header;
 	image.header_size = size;
-	image.size = ((highest + 0xfff) & ~0xfffu) - ADSP_MEMORY;
+	image.size = ((highest + 0xfff) & ~0xfffu) - base;
 	printf("adsp: %u: the image is whole (%s): a header of %llu bytes (%u of hashes), %u segments, %llu bytes of files, %#x "
-	    "bytes of the DSP's %#x from %#x\n", step, from_root ? "from /fw on the root" : "from the small image", size, hashes,
-	    image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY);
+	    "bytes of the DSP's %#x from %#x (linked at %#x%s)\n", step, from_root ? "from /fw on the root" : "from the small image",
+	    size, hashes, image.segments, files, image.size, ADSP_MEMORY_SIZE, ADSP_MEMORY, base, relocatable ? ", relocatable" : "");
 	return true;
 fail:
 	image_forget();
@@ -1456,8 +1475,14 @@ step_image(void)
 	if (image.segments == 0) {
 		return false;
 	}
-	announce("put the image's segments into the audio DSP's memory (0x86700000, 64 MB: memory of nobody's until TrustZone "
-	    "starts the DSP), with zeroes where a segment is longer than its file, and read them back");
+	{
+		char what[200];
+
+		snprintf(what, sizeof(what), "put the image's segments into the audio DSP's memory (%#x, %u MB: memory of nobody's "
+		    "until TrustZone starts the DSP), with zeroes where a segment is longer than its file, and read them back",
+		    ADSP_MEMORY, ADSP_MEMORY_SIZE >> 20);
+		announce(what);
+	}
 	dsp_memory = (volatile uint64_t *)ml_io_map_unmappable(ADSP_MEMORY, ADSP_MEMORY_SIZE, VM_WIMG_WCOMB);
 	snprintf(last_write, sizeof(last_write), "step %u wrote the image at %#x", step, ADSP_MEMORY);
 	for (unsigned s = 0; s < image.segments; s++) {
@@ -2667,6 +2692,32 @@ static struct {
 	volatile bool runs;
 } battmgr;
 
+/*
+ * The OnePlus 9 Pro (board=lemonadep): its battery is measured by a fuel gauge of its own, which
+ * the DSP does not read (bsd/dev/redwood_gauge.c does, with battery=1), and the DSP's figures for the
+ * battery are made up there (battmgr=2, 24 October: 45% where the gauge says 33%, 25 degrees always,
+ * 6660 mAh designed). What the DSP does know is the USB port: whether something is plugged in, what
+ * kind of port, its voltage and current. With battery=1 on that board only that is asked, and the
+ * gauge's driver takes it from redwood_battmgr_usb(). (The charging itself is the DSP's own doing
+ * once it runs: nothing here asks it to.)
+ */
+static bool battmgr_usb_only;
+static volatile int32_t battmgr_usb_online = -1, battmgr_usb_type, battmgr_usb_uv, battmgr_usb_ua;
+
+/* Is a USB power source plugged in, as the DSP's battery manager says: 1 or 0, or -1 when that is not known. */
+int
+redwood_battmgr_usb(int32_t *type, int32_t *uv, int32_t *ua)
+{
+	int32_t online = battmgr.runs ? battmgr_usb_online : -1;
+
+	if (online > 0) {
+		*type = battmgr_usb_type;
+		*uv = battmgr_usb_uv;
+		*ua = battmgr_usb_ua;
+	}
+	return online;
+}
+
 static void
 battmgr_input(const uint8_t *data, uint32_t length)
 {
@@ -2751,7 +2802,31 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 			tell("adsp: battmgr: USB property %u: %s %u (%d)\n", p, ok ? "" : "NO ANSWER", v, (int)v);
 		}
 	}
-	for (unsigned round = 0; battmgr.wanted && glink.up && glink.channel[CHANNEL_PMIC].open; round++) {
+	for (unsigned round = 0; battmgr_usb_only && battmgr.wanted && glink.up && glink.channel[CHANNEL_PMIC].open; round++) {
+		uint32_t usb = 0, usb_type = 0, usb_volt = 0, usb_curr = 0;
+		bool good = battmgr_get(BATTMGR_USB_GET, USB_ONLINE, &usb);
+
+		if (good && usb) {
+			(void)battmgr_get(BATTMGR_USB_GET, USB_TYPE, &usb_type);
+			(void)battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &usb_volt);
+			(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_NOW, &usb_curr);
+		}
+		battmgr_usb_type = (int32_t)usb_type;
+		battmgr_usb_uv = (int32_t)usb_volt;
+		battmgr_usb_ua = (int32_t)usb_curr;
+		if (good && (int32_t)usb != battmgr_usb_online) {
+			tell("adsp: battmgr: USB %s (type %u, %u uV, %u uA)\n", usb ? "plugged in" : "unplugged", usb_type, usb_volt,
+			    usb_curr);
+		}
+		battmgr_usb_online = good ? (int32_t)(usb != 0) : -1;
+		if (!good && round % 6 == 0) {
+			tell("adsp: battmgr: NO ANSWER about the USB port\n");
+		}
+		for (unsigned ms = 0; ms < 5000 && battmgr.wanted && glink.up; ms += 50) {
+			sleep_ms(50);
+		}
+	}
+	for (unsigned round = 0; !battmgr_usb_only && battmgr.wanted && glink.up && glink.channel[CHANNEL_PMIC].open; round++) {
 		struct redwood_battery_state b = { .size = sizeof(b) };
 		uint32_t capacity = 0, status = 0, present = 0, volt = 0, curr = 0, temp = 0, usb = 0;
 		uint32_t usb_type = 0, usb_volt = 0, usb_curr = 0, charge = 0;
@@ -2806,6 +2881,7 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 			sleep_ms(50);
 		}
 	}
+	battmgr_usb_online = -1;
 	battmgr.runs = false;
 	thread_terminate(current_thread());
 }
@@ -2821,7 +2897,10 @@ battmgr_start(void)
 	if (wanted == 0 || battmgr.runs) {
 		return;
 	}
-	if (option("battery")) {
+	if (option("battery") && board_lemonadep) {
+		/* (the 9 Pro's gauge is read by redwood_gauge.c: the DSP is asked about the USB port only) */
+		battmgr_usb_only = true;
+	} else if (option("battery")) {
 		/* (the loader's way, through Qualcomm's UEFI charger drivers: one way to the battery at a time) */
 		tell("adsp: battmgr: not with battery=1: the battery is asked about the loader's way\n");
 		return;
@@ -3213,22 +3292,24 @@ redwood_adsp_init(void)
 		return;
 	}
 	/*
-	 * The OnePlus 9 Pro (lemonadep, SM8350) has its peripherals at the same address and, by the
-	 * vendor's lahaina.dtsi, the same shared memory, command database, IPCC and AOP mailbox, DSP
-	 * image number (1), remote processor (2) and rails (LCX, LMX) as this file; its DSP's memory is
-	 * another (see ADSP_MEMORY). Only the two steps that read are done there for now: from step 3
-	 * on, TrustZone, the always-on processor and RPMh are asked things for that phone untried.
+	 * The OnePlus 9 Pro (lemonadep, SM8350) has its peripherals at the same address and, by its own
+	 * device tree (vendor_boot_a), the same shared memory, command database, IPCC and AOP mailbox,
+	 * SMP2P items, DSP image number (1), remote processor (2) and rails (LCX, LMX) as this file; its
+	 * DSP's memory is another (see ADSP_MEMORY), and its image is relocatable (step 2). Any other
+	 * board is refused: its DSP's memory is not known here.
 	 */
 	{
 		char board[32];
 
 		if (PE_parse_boot_arg_str("board", board, sizeof(board)) && strcmp(board, "redwood") != 0) {
-			if (strcmp(board, "lemonadep") != 0 || last_step == 0 || last_step > 2) {
-				printf("adsp: on board=%s only adsp_step=1 and 2 (reads) for now\n", board);
+			if (strcmp(board, "lemonadep") != 0) {
+				printf("adsp: adsp=1 and adsp_step=N know the redwood's and the lemonadep's audio DSP, not board=%s's\n",
+				    board);
 				return;
 			}
 			adsp_memory = 0x86100000u;
 			adsp_memory_size = 0x02100000u;
+			board_lemonadep = true;
 		}
 	}
 	if (last_step == 0) {

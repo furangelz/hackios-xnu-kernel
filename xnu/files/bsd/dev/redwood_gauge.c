@@ -355,7 +355,7 @@ gauge_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	struct redwood_battery_state state;
 	uint8_t registers[0x16];
-	bool all = true, any = false, charging_seen = false;
+	bool all = true, any = false, charging_seen = false, charging_stopped = false;
 
 	uint32_t scan = 0;
 
@@ -419,8 +419,27 @@ gauge_thread(__unused void *parameter, __unused wait_result_t result)
 			    charger_ok ? "ok" : "NOT ANSWERING", status, faults, vin, iin, ichg, vbat, gauge_bus.nacks, charger_bus.nacks,
 			    gauge_bus.stretches, charger_bus.stretches);
 		}
+		/*
+		 * The charging is the audio DSP's (adsp=1), and the DSP does not read this battery's
+		 * temperature (it says 25 degrees, always) nor this gauge. So the gauge watches: charging
+		 * outside 0..45 C, or a cell above 4.40 V (the DSP's own limit is 4.35: 8.7 V for the pack),
+		 * and the DSP is shut down, which ends the charging without telling the charger anything.
+		 */
+		if (gauge_ok && ma > 20 && !charging_stopped) {
+			int32_t celsius = (decikelvin - 2731) / 10;
+
+			if (celsius > 45 || celsius < 0 || mv / 2 > 4400) {
+				charging_stopped = true;
+				printf("battery: CHARGING STOPPED: %d C, %d mV a cell while taking %d mA: the audio DSP, which charges, is "
+				    "shut down\n", celsius, mv / 2, ma);
+				redwood_adsp_stop();
+			}
+		}
 		if (gauge_ok && soc >= 0 && soc <= 100) {
-			bool input = charger_ok ? !(status & (1u << 1)) : ma > -50;
+			int32_t usb_type = 0, usb_uv = 0, usb_ua = 0;
+			int usb = redwood_battmgr_usb(&usb_type, &usb_uv, &usb_ua);
+			/* plugged in: what the charger says if it answers, else what the DSP says, else the current alone */
+			bool input = charger_ok ? !(status & (1u << 1)) : usb >= 0 ? usb != 0 : ma > -50;
 			unsigned stage = charger_ok ? (status >> 2) & 3 : ma > 20 ? 2 : 0;
 
 			bzero(&state, sizeof(state));
@@ -436,8 +455,9 @@ gauge_thread(__unused void *parameter, __unused wait_result_t result)
 			state.full_uah = full * 1000;
 			state.design_uah = design * 1000;
 			state.cycles = cycles;
-			state.usb_voltage_uv = input ? vin * 1000 : 0;
-			state.usb_current_ua = input ? iin * 1000 : 0;
+			state.usb_type = usb > 0 ? usb_type : 0;
+			state.usb_voltage_uv = !input ? 0 : charger_ok ? vin * 1000 : usb_uv;
+			state.usb_current_ua = !input ? 0 : charger_ok ? iin * 1000 : usb_ua;
 			redwood_battery_report(&state);
 		}
 		delay_for_interval(5000, NSEC_PER_MSEC);
