@@ -16,13 +16,13 @@
 #
 # usage: common/setup.sh            clone hackios-xnu-userland into this tree (or update it) and
 #                                   check the host for the tools the build needs
-#   USERLAND_URL=...   where to clone from (default: github.com/oosexgang/hackios-xnu-userland)
-#   USERLAND_REF=...   branch or tag (default: main)
+#   USERLAND_URL=...   where to clone from (default, on the lemonadep branch: github.com/furangelz/hackios-xnu-userland)
+#   USERLAND_REF=...   branch or tag (default, on the lemonadep branch: lemonadep)
 set -e
 cd "$(dirname "$(readlink -f "$0")")/.."
 ROOT=$PWD
-URL=${USERLAND_URL:-https://github.com/oosexgang/hackios-xnu-userland.git}
-REF=${USERLAND_REF:-main}
+URL=${USERLAND_URL:-https://github.com/furangelz/hackios-xnu-userland.git}
+REF=${USERLAND_REF:-lemonadep}
 UG=(git --git-dir="$ROOT/.userland.git" --work-tree="$ROOT")
 
 if [ ! -d .userland.git ]; then

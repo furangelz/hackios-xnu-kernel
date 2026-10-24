@@ -1,5 +1,10 @@
 # HackiOS — XNU kernel
 
+> **This fork's `lemonadep` branch** ports HackiOS to the **OnePlus 9 Pro** (Snapdragon 888, `lemonadep`): see
+> [docs/lemonadep.md](docs/lemonadep.md) for its state and how to run it, and
+> [furangelz/ios-sweet](https://github.com/furangelz/ios-sweet) for the project's notes and setup. The rest of this
+> README is HackiOS's own, about the POCO X5 Pro (redwood).
+
 **HackiOS** boots Apple's open-source **XNU kernel** (`xnu-8796.121.2`, the kernel of iOS 16.5) on Android phone
 hardware and runs the **unmodified iOS 16.5 user space** on top of it: launchd → backboardd → SpringBoard →
 apps. Our own EFI loader, our own replacements for Apple's closed drivers, a UEFI port, and a Linux Wi-Fi driver
