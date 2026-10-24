@@ -2646,7 +2646,8 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
  * answer, or 2, a notice; an opcode) and its words; a property is asked for with opcode 0x30 (the
  * battery's) or 0x32 (the USB port's), the battery's number (0), the property's number and a word
  * that a get does not use, and is answered with the property's number, its value and a result (0:
- * good). Only gets are sent from here: nothing is set, no limit, no current, no notice asked for.
+ * good). On the redwood only gets are sent from here: nothing is set, no limit, no current, no notice
+ * asked for. On the 9 Pro two limits are set, as Android sets them (battmgr_limits()).
  * With adsp=1 (battmgr=0: not) it is asked every BATTMGR_SECONDS while the DSP runs, and what it says
  * goes to bsd/dev/redwood_battery.c (redwood_battery_report()), and from there to the power source
  * that iOS reads (iokit/Kernel/RedwoodBattery.cpp). battmgr=2: every property once, for the log.
@@ -2662,10 +2663,13 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 #define BATTMGR_REQUEST         1
 #define BATTMGR_NOTICE          2
 #define BATTMGR_BATTERY_GET     0x30
+#define BATTMGR_BATTERY_SET     0x31            /* (lemonadep only, see battmgr_limits()) */
 #define BATTMGR_USB_GET         0x32
+#define BATTMGR_USB_SET         0x33            /* (lemonadep only) */
 #define BATT_STATUS             0               /* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
 #define BATT_HEALTH             1
 #define BATT_CHARGE_TYPE        3               /* (lemonadep) Linux's POWER_SUPPLY_CHARGE_TYPE_*: 1 none, 2 trickle, 3 fast */
+#define BATT_CHG_CTRL_LIM       10              /* (lemonadep) uA the battery may take: 500000 as the DSP starts */
 #define BATT_PRESENT            2
 #define BATT_CAPACITY           4
 #define BATT_VOLT_NOW           7
@@ -2706,6 +2710,7 @@ static struct {
  */
 static bool battmgr_usb_only;
 static volatile int32_t battmgr_usb_online = -1, battmgr_usb_type, battmgr_usb_uv, battmgr_usb_ua;
+static uint32_t charge_ma;              /* boot-arg charge_ma=N (lemonadep): the input limit on a wall charger */
 
 /* Is a USB power source plugged in, as the DSP's battery manager says: 1 or 0, or -1 when that is not known. */
 int
@@ -2775,6 +2780,82 @@ battmgr_get(uint32_t opcode, uint32_t property, uint32_t *value)
 	return false;
 }
 
+/* One property set and the DSP's answer waited for (a second at most): true if it took it. */
+static bool
+battmgr_set(uint32_t opcode, uint32_t property, uint32_t value)
+{
+	struct battmgr_message q = { BATTMGR_OWNER, BATTMGR_REQUEST, opcode, { 0, property, value } };
+	uint32_t before = os_atomic_load(&battmgr.answers, acquire);
+
+	if (glink_send(&glink.channel[CHANNEL_PMIC], &q, sizeof(q)) != 0) {
+		return false;
+	}
+	for (unsigned ms = 0; ms < 1000; ms++) {
+		if (os_atomic_load(&battmgr.answers, acquire) != before) {
+			if (battmgr.opcode != opcode || battmgr.length < sizeof(struct battmgr_message)) {
+				before = battmgr.answers;       /* (somebody else's answer: wait on) */
+				continue;
+			}
+			return battmgr.result == 0;
+		}
+		sleep_ms(1);
+	}
+	return false;
+}
+
+/*
+ * How much the 9 Pro may take. The DSP sets the input limit itself for the chargers it recognises; for
+ * a computer's port (SDP) and USB-PD it waits to be told, as Android's USB driver tells it 500 or 900 mA
+ * once the port has said what it gives (qti_battery_charger.c, usb_psy_set_icl(): only for those two
+ * types). It calls this phone's wall charger a computer's port as well (24 October: type 1, 500 mA,
+ * VBUS 5.0 V), and nothing here can tell the two apart: the loader's link is USB 2 (480 Mbit/s), whose
+ * port gives 500 mA, whatever the DSP says it gives at most (900 mA), and a port that cuts its power
+ * for drawing too much takes the loader's USB with it (it does not come back). So only when asked:
+ * boot-arg charge_ma=N, for a run on a wall charger, sets the input limit to N mA, at most 2000 (the
+ * dtbo's figure for a charger), on those two types, and the battery's own limit, which the DSP keeps
+ * at 500 mA, to 1000 mA (Qualcomm's DEFAULT_RESTRICT_FCC_UA: this battery is worn, 1619 of 2220 mAh).
+ * The charger still backs off by itself from a source whose voltage sags, and the gauge's guard
+ * (redwood_gauge.c) still shuts the DSP down at 45 C or 4.40 V a cell.
+ * Tried on OnePlus's own Warp charger (24 October, charge_ma=1500): the DSP took the limit, and the
+ * battery then took charge in 4 readings of 95 and gave up to 742 mA in the others, at 43.4 C: a
+ * Warp charger gives its current only after OnePlus's own handshake (VOOC), which nothing does here,
+ * and without it it does not keep 1.5 A up. At 500 mA (no charge_ma) it charged in 70 of 84. So do
+ * not use it with that charger; it is for a plain charger that is known to give the current.
+ */
+#define USB_TYPE_SDP            1               /* Linux's POWER_SUPPLY_USB_TYPE_SDP */
+#define USB_TYPE_PD             6               /* ... _PD */
+#define CHARGE_MA_MOST          2000
+#define CHARGE_FCC_UA           1000000u
+
+static void
+battmgr_limits(uint32_t usb_type, uint32_t most, bool loud)
+{
+	uint32_t want, limit = 0, fcc = 0;
+	bool ok;
+
+	if (charge_ma == 0 || (usb_type != USB_TYPE_SDP && usb_type != USB_TYPE_PD)) {
+		return;                         /* (not asked; or a charger the DSP knows: its own limit) */
+	}
+	want = (charge_ma < CHARGE_MA_MOST ? charge_ma : CHARGE_MA_MOST) * 1000;
+	if (battmgr_get(BATTMGR_USB_GET, USB_INPUT_LIMIT, &limit) && limit != want) {
+		ok = battmgr_set(BATTMGR_USB_SET, USB_INPUT_LIMIT, want);
+		(void)battmgr_get(BATTMGR_USB_GET, USB_INPUT_LIMIT, &limit);
+		if (loud) {
+			tell("adsp: battmgr: input limit %u uA asked for (%s): the DSP now takes %u uA\n", want, ok ? "taken" : "REFUSED",
+			    limit);
+		}
+	}
+	(void)most;
+	if (battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_CTRL_LIM, &fcc) && fcc != CHARGE_FCC_UA) {
+		ok = battmgr_set(BATTMGR_BATTERY_SET, BATT_CHG_CTRL_LIM, CHARGE_FCC_UA);
+		(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHG_CTRL_LIM, &fcc);
+		if (loud) {
+			tell("adsp: battmgr: battery limit %u uA asked for (%s): the DSP now lets it take %u uA\n", CHARGE_FCC_UA,
+			    ok ? "taken" : "REFUSED", fcc);
+		}
+	}
+}
+
 static void
 battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 {
@@ -2814,9 +2895,6 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 			(void)battmgr_get(BATTMGR_USB_GET, USB_VOLT_NOW, &usb_volt);
 			(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_NOW, &usb_curr);
 		}
-		battmgr_usb_type = (int32_t)usb_type;
-		battmgr_usb_uv = (int32_t)usb_volt;
-		battmgr_usb_ua = (int32_t)usb_curr;
 		if (good && ((int32_t)usb != battmgr_usb_online || (usb && (int32_t)usb_type != battmgr_usb_type))) {
 			uint32_t limit = 0, most = 0;
 
@@ -2826,7 +2904,19 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 			}
 			tell("adsp: battmgr: USB %s (type %u, %u uV, %u uA; the port gives at most %u uA, the DSP takes %u uA)\n",
 			    usb ? "plugged in" : "unplugged", usb_type, usb_volt, usb_curr, most, limit);
+			if (usb) {
+				battmgr_limits(usb_type, most, true);
+			}
+		} else if (good && usb && round % 6 == 3) {
+			uint32_t most = 0;
+
+			/* (the DSP may have set its own limit again meanwhile: a sagging source, a new negotiation) */
+			(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_MAX, &most);
+			battmgr_limits(usb_type, most, false);
 		}
+		battmgr_usb_type = (int32_t)usb_type;
+		battmgr_usb_uv = (int32_t)usb_volt;
+		battmgr_usb_ua = (int32_t)usb_curr;
 		battmgr_usb_online = good ? (int32_t)(usb != 0) : -1;
 		if (good && usb && round % 6 == 0) {
 			uint32_t limit = 0, status = 0, charge_type = 0;
@@ -2926,6 +3016,7 @@ battmgr_start(void)
 	if (option("battery") && board_lemonadep) {
 		/* (the 9 Pro's gauge is read by redwood_gauge.c: the DSP is asked about the USB port only) */
 		battmgr_usb_only = true;
+		PE_parse_boot_argn("charge_ma", &charge_ma, sizeof(charge_ma));
 	} else if (option("battery")) {
 		/* (the loader's way, through Qualcomm's UEFI charger drivers: one way to the battery at a time) */
 		tell("adsp: battmgr: not with battery=1: the battery is asked about the loader's way\n");
