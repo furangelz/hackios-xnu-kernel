@@ -76,6 +76,7 @@ void redwood_battery_report(const struct redwood_battery_state *state);
 void redwood_gauge_start(void);         /* (battery=1 on board=lemonadep) the 9 Pro's BQ28Z610 gauge and MP2650 charger, read */
 int redwood_battmgr_usb(int32_t *type, int32_t *uv, int32_t *ua);      /* (adsp=1) USB plugged in, as the DSP says: 1, 0, -1 unknown */
 void redwood_adsp_stop(void);           /* the audio DSP (and with it, on lemonadep, the charging) stopped */
+void redwood_dpu_note(unsigned line, const char *text);     /* (lemonadep) a line drawn on the panel when the run ends */
 void redwood_net_init(void);            /* en0, if there is something to carry its frames: sys/redwood_net.h */
 void redwood_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
 void redwood_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */

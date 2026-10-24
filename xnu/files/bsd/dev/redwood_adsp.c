@@ -2665,6 +2665,7 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 #define BATTMGR_USB_GET         0x32
 #define BATT_STATUS             0               /* Linux's POWER_SUPPLY_STATUS_*: 1 charging, 2 discharging, 3 not charging, 4 full */
 #define BATT_HEALTH             1
+#define BATT_CHARGE_TYPE        3               /* (lemonadep) Linux's POWER_SUPPLY_CHARGE_TYPE_*: 1 none, 2 trickle, 3 fast */
 #define BATT_PRESENT            2
 #define BATT_CAPACITY           4
 #define BATT_VOLT_NOW           7
@@ -2678,6 +2679,8 @@ apr_ask(uint8_t service, uint32_t opcode, const void *payload, uint32_t length, 
 #define USB_CURR_NOW            3               /* uA, what the port gives */
 #define USB_TYPE                6               /* Linux's POWER_SUPPLY_USB_TYPE_*: 1 here, a computer's port */
 #define USB_ONLINE              0
+#define USB_CURR_MAX            4               /* (lemonadep, Linux's sm8350 numbering) uA the port may give */
+#define USB_INPUT_LIMIT         5               /* (lemonadep) uA the DSP lets the phone take from it */
 #define BATTMGR_SECONDS         10
 
 struct battmgr_message {
@@ -2814,11 +2817,34 @@ battmgr_thread(__unused void *parameter, __unused wait_result_t result)
 		battmgr_usb_type = (int32_t)usb_type;
 		battmgr_usb_uv = (int32_t)usb_volt;
 		battmgr_usb_ua = (int32_t)usb_curr;
-		if (good && (int32_t)usb != battmgr_usb_online) {
-			tell("adsp: battmgr: USB %s (type %u, %u uV, %u uA)\n", usb ? "plugged in" : "unplugged", usb_type, usb_volt,
-			    usb_curr);
+		if (good && ((int32_t)usb != battmgr_usb_online || (usb && (int32_t)usb_type != battmgr_usb_type))) {
+			uint32_t limit = 0, most = 0;
+
+			if (usb) {
+				(void)battmgr_get(BATTMGR_USB_GET, USB_INPUT_LIMIT, &limit);
+				(void)battmgr_get(BATTMGR_USB_GET, USB_CURR_MAX, &most);
+			}
+			tell("adsp: battmgr: USB %s (type %u, %u uV, %u uA; the port gives at most %u uA, the DSP takes %u uA)\n",
+			    usb ? "plugged in" : "unplugged", usb_type, usb_volt, usb_curr, most, limit);
 		}
 		battmgr_usb_online = good ? (int32_t)(usb != 0) : -1;
+		if (good && usb && round % 6 == 0) {
+			uint32_t limit = 0, status = 0, charge_type = 0;
+
+			(void)battmgr_get(BATTMGR_USB_GET, USB_INPUT_LIMIT, &limit);
+			(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_STATUS, &status);
+			(void)battmgr_get(BATTMGR_BATTERY_GET, BATT_CHARGE_TYPE, &charge_type);
+			tell("adsp: battmgr: USB type %u, %u uV, %u uA, the DSP takes %u uA; battery status %u, charge type %u\n",
+			    usb_type, usb_volt, usb_curr, limit, status, charge_type);
+			{
+				char note[48];
+
+				snprintf(note, sizeof(note), "USB type %u, %u mV, %u mA", usb_type, usb_volt / 1000, usb_curr / 1000);
+				redwood_dpu_note(5, note);
+				snprintf(note, sizeof(note), "DSP limit %u mA, status %u, charge %u", limit / 1000, status, charge_type);
+				redwood_dpu_note(6, note);
+			}
+		}
 		if (!good && round % 6 == 0) {
 			tell("adsp: battmgr: NO ANSWER about the USB port\n");
 		}

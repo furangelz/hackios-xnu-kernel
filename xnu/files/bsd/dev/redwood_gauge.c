@@ -355,9 +355,13 @@ gauge_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	struct redwood_battery_state state;
 	uint8_t registers[0x16];
-	bool all = true, any = false, charging_seen = false, charging_stopped = false;
+	bool all = true, any = false, charging_seen = false, charging_stopped = false, every_tick;
 
-	uint32_t scan = 0;
+	uint32_t scan = 0, log_all = 0, readings = 0, charging_readings = 0;
+	int32_t first_soc = -1, most_in = -100000, most_out = 100000;
+
+	/* boot-arg battery_log=1: the gauge's line every 5 s, not every minute */
+	every_tick = PE_parse_boot_argn("battery_log", &log_all, sizeof(log_all)) && log_all;
 
 	tlmm = ml_io_map(TLMM_PHYS, TLMM_SIZE);
 	bus_take(&gauge_bus);
@@ -405,13 +409,34 @@ gauge_thread(__unused void *parameter, __unused wait_result_t result)
 			(void)charger_adc(CHARGER_CHARGE_CURRENT, 1250, &ichg);
 			(void)charger_adc(CHARGER_BATTERY_VOLTAGE, 1250, &vbat);
 		}
+		/* what the run says on the panel at its end (redwood_dpu.c), for when its log does not come back */
+		if (gauge_ok) {
+			char note[48];
+
+			if (first_soc < 0) {
+				first_soc = soc;
+			}
+			readings++;
+			charging_readings += ma > 20;
+			most_in = ma > most_in ? ma : most_in;
+			most_out = ma < most_out ? ma : most_out;
+			redwood_dpu_note(0, "BATTERY (gauge, every 5 s)");
+			snprintf(note, sizeof(note), "%d%% at the start, %d%% now, %d mV", first_soc, soc, mv);
+			redwood_dpu_note(1, note);
+			snprintf(note, sizeof(note), "now %d mA, %d.%d C", ma, (decikelvin - 2731) / 10, ((decikelvin - 2731) % 10 + 10) % 10);
+			redwood_dpu_note(2, note);
+			snprintf(note, sizeof(note), "most in %d mA, most out %d mA", most_in, most_out);
+			redwood_dpu_note(3, note);
+			snprintf(note, sizeof(note), "charging in %u of %u readings", charging_readings, readings);
+			redwood_dpu_note(4, note);
+		}
 		/* the battery's current changing sides is said at once: charging begins or ends */
 		if (gauge_ok && (ma > 20) != charging_seen) {
 			charging_seen = ma > 20;
 			printf("battery: %s: %d mA, %d%%, %d mV\n", charging_seen ? "the battery takes charge" : "the battery takes no charge",
 			    ma, soc, mv);
 		}
-		if (tick % 12 == 0) {
+		if (tick % 12 == 0 || every_tick) {
 			printf("battery: gauge %s: %d%%, %d mV, %d mA, %d.%d C, flags %#x, %d of %d mAh (design %d), %d cycles; charger %s: "
 			    "status %#x faults %#x, in %d mV %d mA, charging %d mA, battery %d mV; %llu+%llu reads not acknowledged, "
 			    "%llu+%llu clock waits too long\n", gauge_ok ? "ok" : "NOT ANSWERING", soc, mv, ma,
@@ -430,6 +455,7 @@ gauge_thread(__unused void *parameter, __unused wait_result_t result)
 
 			if (celsius > 45 || celsius < 0 || mv / 2 > 4400) {
 				charging_stopped = true;
+				redwood_dpu_note(7, "CHARGING STOPPED (temperature/voltage)");
 				printf("battery: CHARGING STOPPED: %d C, %d mV a cell while taking %d mA: the audio DSP, which charges, is "
 				    "shut down\n", celsius, mv / 2, ma);
 				redwood_adsp_stop();

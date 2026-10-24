@@ -35,6 +35,7 @@
 #include <pexpert/pexpert.h>
 #include <sys/errno.h>
 #include <sys/systm.h>
+#include <console/video_console.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 extern void loader_log_putc(char c);
@@ -544,6 +545,66 @@ backlight_init(void)
 	MiniIOMobileFramebufferBacklight();
 }
 
+/* ---- notes on the panel at the end of a run ------------------------------------------------------- */
+
+/*
+ * A few lines that other drivers keep up to date (redwood_dpu_note()) and that are drawn on the panel
+ * when the kernel goes back to the loader: what a run says about itself when its log cannot come
+ * back over USB (a cable pulled during a run leaves the loader without USB: 24 October), read off
+ * the panel instead. Drawn with the text console's font, three times its size, over the picture.
+ */
+#define NOTE_LINES              8
+#define NOTE_CHARS              44
+#define NOTE_SCALE              3
+#define NOTE_TOP                160
+
+extern struct vc_info vinfo;
+extern unsigned char iso_font[];
+static char notes[NOTE_LINES][NOTE_CHARS + 1];
+
+void
+redwood_dpu_note(unsigned line, const char *text)
+{
+	if (line < NOTE_LINES) {
+		strlcpy(notes[line], text, sizeof(notes[line]));
+	}
+}
+
+static void
+draw_notes(void)
+{
+	uint8_t *fb = (uint8_t *)vinfo.v_baseaddr;
+
+	if (fb == NULL || vinfo.v_depth != 32) {
+		return;
+	}
+	for (unsigned line = 0; line < NOTE_LINES; line++) {
+		uint32_t y0 = NOTE_TOP + line * 16 * NOTE_SCALE;
+		size_t length = strlen(notes[line]);
+
+		if (length == 0 || y0 + 16 * NOTE_SCALE > vinfo.v_height) {
+			continue;
+		}
+		for (uint32_t y = y0; y < y0 + 16 * NOTE_SCALE; y++) {
+			uint32_t *row = (uint32_t *)(fb + (size_t)y * vinfo.v_rowbytes);
+			const uint32_t glyph_row = (y - y0) / NOTE_SCALE;
+
+			for (uint32_t x = 0; x < vinfo.v_width; x++) {
+				uint32_t dot = x / NOTE_SCALE;         /* in the font's pixels, two of margin first */
+				bool lit = false;
+
+				if (dot >= 2 && (dot - 2) / 8 < length) {
+					unsigned char c = (unsigned char)notes[line][(dot - 2) / 8];
+
+					lit = (iso_font[c * 16 + glyph_row] & (1u << ((dot - 2) % 8))) != 0;
+				}
+				row[x] = lit ? 0xffffffffu : 0xff000000u;
+			}
+		}
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
 /* The boot loader's framebuffer on the panel again: for the text console, a panic, the loader. */
 void
 redwood_dpu_restore(void)
@@ -559,6 +620,7 @@ redwood_dpu_restore(void)
 	if (backlight_ok && backlight_level != BACKLIGHT_BOOT && dcs_brightness(BACKLIGHT_BOOT, NULL) == 0) {
 		backlight_level = BACKLIGHT_BOOT;
 	}
+	draw_notes();
 }
 
 void
