@@ -961,8 +961,14 @@ step_survey(void)
 
 /* ---- step 2: the firmware -------------------------------------------------------------------------- */
 
-#define ADSP_MEMORY             0x86700000u     /* dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000 */
-#define ADSP_MEMORY_SIZE        0x04000000u
+/*
+ * dt: reserved-memory adsp@86700000, memory-region of qcom,lpass@3700000. The OnePlus 9 Pro's
+ * (board=lemonadep): pil_adsp_region@86100000, 33 MB, memory-region of qcom,lpass@17300000
+ * (the vendor's lahaina.dtsi, LineageOS android_kernel_oneplus_sm8350).
+ */
+static uint32_t adsp_memory = 0x86700000u, adsp_memory_size = 0x04000000u;
+#define ADSP_MEMORY             adsp_memory
+#define ADSP_MEMORY_SIZE        adsp_memory_size
 #define PAS_ADSP                1               /* dt: qcom,pas-id */
 
 
@@ -3205,6 +3211,25 @@ redwood_adsp_init(void)
 	if (pe_arm_get_soc_base_phys() != REDWOOD_SOC_BASE) {
 		printf("adsp: adsp=1 and adsp_step=N are for the phone's audio DSP, and this is not the phone\n");
 		return;
+	}
+	/*
+	 * The OnePlus 9 Pro (lemonadep, SM8350) has its peripherals at the same address and, by the
+	 * vendor's lahaina.dtsi, the same shared memory, command database, IPCC and AOP mailbox, DSP
+	 * image number (1), remote processor (2) and rails (LCX, LMX) as this file; its DSP's memory is
+	 * another (see ADSP_MEMORY). Only the two steps that read are done there for now: from step 3
+	 * on, TrustZone, the always-on processor and RPMh are asked things for that phone untried.
+	 */
+	{
+		char board[32];
+
+		if (PE_parse_boot_arg_str("board", board, sizeof(board)) && strcmp(board, "redwood") != 0) {
+			if (strcmp(board, "lemonadep") != 0 || last_step == 0 || last_step > 2) {
+				printf("adsp: on board=%s only adsp_step=1 and 2 (reads) for now\n", board);
+				return;
+			}
+			adsp_memory = 0x86100000u;
+			adsp_memory_size = 0x02100000u;
+		}
 	}
 	if (last_step == 0) {
 		/* all of it, on a thread of its own, and left up */

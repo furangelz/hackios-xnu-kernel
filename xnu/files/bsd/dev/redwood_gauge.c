@@ -355,7 +355,7 @@ gauge_thread(__unused void *parameter, __unused wait_result_t result)
 {
 	struct redwood_battery_state state;
 	uint8_t registers[0x16];
-	bool all = true, any = false;
+	bool all = true, any = false, charging_seen = false;
 
 	uint32_t scan = 0;
 
@@ -404,6 +404,12 @@ gauge_thread(__unused void *parameter, __unused wait_result_t result)
 			(void)charger_adc(CHARGER_INPUT_CURRENT, 625, &iin);
 			(void)charger_adc(CHARGER_CHARGE_CURRENT, 1250, &ichg);
 			(void)charger_adc(CHARGER_BATTERY_VOLTAGE, 1250, &vbat);
+		}
+		/* the battery's current changing sides is said at once: charging begins or ends */
+		if (gauge_ok && (ma > 20) != charging_seen) {
+			charging_seen = ma > 20;
+			printf("battery: %s: %d mA, %d%%, %d mV\n", charging_seen ? "the battery takes charge" : "the battery takes no charge",
+			    ma, soc, mv);
 		}
 		if (tick % 12 == 0) {
 			printf("battery: gauge %s: %d%%, %d mV, %d mA, %d.%d C, flags %#x, %d of %d mAh (design %d), %d cycles; charger %s: "
