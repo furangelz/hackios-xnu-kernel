@@ -52,6 +52,7 @@ extern "C" bool redwood_dpu_flipped(void);
 extern "C" void redwood_dpu_say(const char * line);
 extern "C" bool redwood_dpu_backlight_ready(void);
 extern "C" int redwood_dpu_backlight(uint32_t level);
+extern "C" void redwood_cpufreq_screen(bool on);       /* bsd/dev/redwood_cpufreq.c: slow while the screen is off */
 
 /* IOConnectCallMethod selectors of the framebuffer user client (iOS 16.5) */
 enum {
@@ -1501,10 +1502,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			    args->scalarInputCount > 1 ? in[1] : 0, args->scalarInputCount > 2 ? in[2] : 0, micros(mach_absolute_time()));
 		}
 		return kIOReturnSuccess;
+	case kFBMethodRequestPowerChange:              /* (0 off, 1 on; the backlight's 0 nits says it better: backlightNits()) */
 	case kFBMethodSwapSignal:
 	case kFBMethodSwapCancel:
 	case kFBMethodSwapCancelAll:
-	case kFBMethodRequestPowerChange:
 	case kFBMethodChangeFrameInfo:
 		return kIOReturnSuccess;
 
@@ -1794,6 +1795,8 @@ backlightNits(uint32_t nits, const char * key)
 		level = kBacklightLevelMax;
 	}
 	error = redwood_dpu_backlight((uint32_t) level);
+	/* dark is the display off (CoreBrightness fades to 0 nits when it locks): the processors may slow meanwhile */
+	redwood_cpufreq_screen(nits != 0);
 	if (nits != gBacklightNits && (gBacklightSets++ < 12 || gBacklightSets % 100 == 0)) {
 		char who[32] = "?", line[160];
 

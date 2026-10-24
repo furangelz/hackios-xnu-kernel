@@ -12,6 +12,7 @@
  * Register layout: Linux drivers/cpufreq/qcom-cpufreq-hw.c ("epss" variant).
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <os/atomic_private.h>
 #include <libkern/libkern.h>
@@ -86,6 +87,20 @@ domain_of(uint32_t phys_id)
 	return core < 4 ? 0 : core < 7 ? 1 : 2;
 }
 
+/*
+ * While the screen is off (redwood_cpufreq_screen(): the backlight at 0 nits, MiniIOMobileFramebuffer.cpp)
+ * every group goes to the first row of its table, its slowest, and the memory's bandwidth vote to what
+ * the loader is left with: the phone charges from a 500 mA port only with what it does not use itself
+ * (lemonadep, 24 October, the screen on and idle: about -10 mA out of the battery at the top, about +65
+ * mA into it with no bandwidth vote). With the screen on again, the top rows and the full vote, at once.
+ * (Not the row the boot loader left: that is whatever the kernel before this one set, the top.)
+ */
+static vm_offset_t domain_base[EPSS_DOMAINS];
+static uint32_t domain_top[EPSS_DOMAINS];
+static bool domain_raised[EPSS_DOMAINS], screen_off;
+static LCK_GRP_DECLARE(cpufreq_lock_group, "redwood-cpufreq");
+static LCK_MTX_DECLARE(cpufreq_lock, &cpufreq_lock_group);
+
 static void
 raise_domain(uint32_t domain, uint32_t cores)
 {
@@ -93,6 +108,7 @@ raise_domain(uint32_t domain, uint32_t cores)
 	vm_offset_t base;
 
 	base = ml_io_map(EPSS_PHYS + domain * EPSS_DOMAIN_SIZE, EPSS_DOMAIN_SIZE);
+	domain_base[domain] = base;
 	for (uint32_t row = 0; row < EPSS_TABLE_ROWS; row++) {
 		uint32_t entry = *(volatile uint32_t *)(base + EPSS_FREQ_TABLE + 4 * row);
 		uint32_t khz = (entry >> 30) ? XO_KHZ * (entry & 0xff) : ALTERNATE_KHZ;
@@ -105,6 +121,8 @@ raise_domain(uint32_t domain, uint32_t cores)
 	}
 	was = *(volatile uint32_t *)(base + EPSS_PERF_STATE);
 	*(volatile uint32_t *)(base + EPSS_PERF_STATE) = top;
+	domain_top[domain] = top;
+	domain_raised[domain] = true;
 	delay_for_interval(20, NSEC_PER_MSEC);
 	tell("cpufreq: group %u (%u of our cores): row %u -> %u of the frequency table, %u MHz\n", domain, cores, was, top,
 	    top_khz / 1000);
@@ -552,6 +570,37 @@ redwood_ddr_quiesce(void)
 	data[0] = data[1] = rest != 0 ? BCM_VOTE(rest, rest) : BCM_COMMIT;     /* 0: no request */
 	done = ddr_rpmh_write(address, data, 2);
 	tell("ddr: memory bandwidth vote %u for the loader: %s\n", rest, done ? "done" : "FAILED");
+}
+
+/* The screen off (false) or on again (true): the processors and the memory slow, or as fast as they go. */
+void redwood_cpufreq_screen(bool on);
+
+void
+redwood_cpufreq_screen(bool on)
+{
+	uint32_t vote = 0x3fff, rest = DDR_REST;
+	bool ddr = false;
+
+	lck_mtx_lock(&cpufreq_lock);
+	if (screen_off == !on) {
+		lck_mtx_unlock(&cpufreq_lock);
+		return;
+	}
+	screen_off = !on;
+	for (uint32_t domain = 0; domain < EPSS_DOMAINS; domain++) {
+		if (domain_raised[domain]) {
+			*(volatile uint32_t *)(domain_base[domain] + EPSS_PERF_STATE) = on ? domain_top[domain] : 0;
+		}
+	}
+	if (ddr_rsc != 0 && ddr_mc0 != 0) {
+		PE_parse_boot_argn("ddr_vote", &vote, sizeof(vote));
+		PE_parse_boot_argn("ddr_rest", &rest, sizeof(rest));
+		ddr = ddr_vote(on ? MIN(vote, 0x3fff) : MIN(rest, 0x3fff));
+		ddr_voted = true;
+	}
+	tell("cpufreq: the screen is %s: the processors to rows %u %u %u, the memory's vote %s\n", on ? "on" : "off",
+	    on ? domain_top[0] : 0, on ? domain_top[1] : 0, on ? domain_top[2] : 0, ddr ? (on ? "up" : "down") : "not changed");
+	lck_mtx_unlock(&cpufreq_lock);
 }
 
 void
