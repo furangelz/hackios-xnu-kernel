@@ -8,7 +8,7 @@ script are in [furangelz/ios-sweet](https://github.com/furangelz/ios-sweet); thi
 Nothing is flashed: the phone `fastboot boot`s a Mu-Silicium UEFI, the UEFI starts our loader, the loader
 receives the kernel and the iOS 16.5 system image over USB and runs them from RAM. A reboot brings back Android.
 
-## State (2026-10-24)
+## State (2026-10-25)
 
 | Works | Not yet |
 |---|---|
@@ -16,6 +16,7 @@ receives the kernel and the iOS 16.5 system image over USB and runs them from RA
 | 7 CPU cores for the kernel (the X1 at 2.84 GHz), the loader watching from core 0 | Sound: the audio DSP runs and its audio services answer, but the speaker path is the redwood's |
 | Touch (Synaptics S3908), power and volume keys | Camera, sensors, alert slider |
 | Adreno 660 through Mesa/freedreno: CoreAnimation draws with OpenGL ES | Fast charging: without OnePlus's VOOC handshake a charger gives 500 mA |
+| Metal for applications, and for CoreAnimation with `camtl=1` (below) | Metal: some layers wrong (boxes behind labels), multisample resolves new and unproven on the phone |
 | No tearing from the framebuffer: frames reach the panel by page flips in the display engine | Charging while the phone waits in the loader between runs |
 | Panel brightness from iOS (slider, dimming, screen off) | Data that survives a reboot (no var store on this phone) |
 | Battery level from the phone's fuel gauge; charging by the phone's own audio DSP firmware | |
@@ -24,6 +25,23 @@ receives the kernel and the iOS 16.5 system image over USB and runs them from RA
 Open problems seen on the phone: horizontal tearing inside iOS's picture while scrolling (every frame is flipped
 whole, so it is not the old cause), heat under use (processors and memory stay at their top speed while the
 screen is on), a magenta tint seen once.
+
+## Metal
+
+iOS's own Metal.framework finds HackiOS's Metal driver (`userland/src/redwoodmetal.m` in hackios-xnu-userland, the
+plug-in `RedwoodMetal.bundle`). The driver compiles Apple's AIR bitcode with the frontend in `tools/mesa/air` (AIR ->
+NIR -> ir3) and draws through Mesa's freedreno, in the same process. Three boot-args:
+
+| Boot-arg | What |
+|---|---|
+| `metal=1` | lets `metal_props on` (userland) name the plug-in on the GPU's `IOAcceleratorES` service, so `MTLCreateSystemDefaultDevice()` returns it |
+| `metal_profile=1` | the GPU families claimed: Apple1 and Apple2 (SpringBoard's Siri orb aborts without Apple2) |
+| `camtl=1` | the window server (CoreAnimation in backboardd) composites with Metal; without it, it keeps OpenGL ES |
+
+On 2026-10-25 (`camtl=1`) the lock screen, home screen, widgets (chronod's RenderBox) and the Today view were
+composited with Metal, and an application's `CAMetalLayer` reached the panel. The test job list is
+`userland/rc.jobs.lemonmetal` (`SKIP="kernel loader boot" common/build.sh lemonadep QUIET=1
+RC_JOBS=rc.jobs.lemonmetal`, with `SYSTEM=1` once for RedwoodTriangle.app).
 
 ## Boot arguments
 
